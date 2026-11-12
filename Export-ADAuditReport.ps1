@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    AuditHat - Active Directory and Group Policy audit report. Version 3.15.0
+    AuditHat - Active Directory and Group Policy audit report. Version 3.18.0
     https://audithat.com
 
     Produces a detailed HTML review of every GPO in the domain, plus a separate
@@ -206,7 +206,7 @@ $Branding = @{
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$script:ScriptVersion = '3.15.0'
+$script:ScriptVersion = '3.18.0'
 $script:ScriptName    = 'Export-ADAuditReport.ps1'
 
 # ---- resolve the branding block into what the rest of the script uses
@@ -506,6 +506,7 @@ $script:Recommendations = @{
     'banner'     = 'Create a logon banner policy that sets both "Interactive logon: Message title" and "Message text for users attempting to log on", linked so it applies to every domain-joined workstation and server. Have the wording approved by management and legal counsel.'
 
     # ---- specific conditions
+    'pwd-profile'      = 'Raise the minimum password length to 14 characters for users and administrators alike, then pick ONE expiry profile and apply it consistently. Examiner profile: a maximum password age of 365 days or less, which keeps a defined expiry on the books while dropping the 60 and 90 day cycles that push users into predictable patterns. NIST profile (SP 800-63B): no expiry at all - a maximum password age of 0 - on the basis that forced rotation produces weaker passwords. NIST allows that only with compensating controls, and an examiner will ask for them: screen new passwords against a list of known-compromised passwords, force a change on any evidence of compromise, and require multi-factor authentication. Set administrators through a fine-grained password policy so their standard does not drift from the domain''s, and make the institution''s written password policy say the same thing as the directory.'
     'banner-partial'   = 'Set the missing value. Windows only displays the banner when both the message title and the message text are configured.'
     'lockout-disabled' = 'Create a lockout policy that locks the account after 5 invalid attempts for 60 minutes, with the failed-attempt counter resetting after 15 minutes. During that hour only an administrator can unlock it, so unlock requests go through the help desk and are ticketed. If every lockout must be released by an administrator, set the duration to 0 (locked until unlocked). A threshold of 0 - the current setting - means an attacker can guess passwords indefinitely.'
     'priv-disabled'    = 'Review the administrative accounts. Remove every disabled account from Domain Admins, Enterprise Admins, Schema Admins and Administrators, and make removal from privileged groups a step in the deprovisioning checklist.'
@@ -532,6 +533,15 @@ $script:GpoPathUsb     = 'Computer Configuration > Policies > Administrative Tem
 $script:GpoPathSaver   = 'User Configuration > Policies > Administrative Templates > Control Panel > Personalization'
 $script:GpoPathRds     = 'Computer Configuration > Policies > Administrative Templates > Windows Components > Remote Desktop Services > Remote Desktop Session Host > Session Time Limits'
 
+# ------------------------------------------------- password strength bar ----
+# The two profiles the report measures password policy against. Both want the
+# same minimum length; they differ on expiry, and a domain can only satisfy one
+# of them at a time, so the report reports against the examiner profile and
+# offers the NIST profile as the alternative. Edit these to your own standard.
+$script:PwdMinLength       = 14     # characters, both profiles
+$script:PwdExaminerMaxAge  = 365    # days - examiner profile: expire at least this often
+$script:PwdNistMaxAge      = 0      # days - NIST profile: 0 = passwords do not expire
+
 function New-RecSetting { param([string]$Setting, [string]$Recommended, [string]$Path, [string]$Match)
     [pscustomobject]@{ Setting = $Setting; Recommended = $Recommended; Path = $Path; Match = $Match } }
 
@@ -540,7 +550,7 @@ $script:RecommendedSettings = @{
         (New-RecSetting 'Minimum password length'                                   '14 characters'                         $script:GpoPathPwd 'MinimumPasswordLength|Minimum password length')
         (New-RecSetting 'Password must meet complexity requirements'               'Enabled'                               $script:GpoPathPwd 'PasswordComplexity|complexity requirements')
         (New-RecSetting 'Enforce password history'                                 '24 passwords remembered'               $script:GpoPathPwd 'PasswordHistorySize|password history')
-        (New-RecSetting 'Maximum password age'                                     'Per the institution''s password policy (e.g. 90 days)' $script:GpoPathPwd 'MaximumPasswordAge|Maximum password age')
+        (New-RecSetting 'Maximum password age'                                     'Examiner profile: 365 days or less. NIST profile: 0 (never expires), with breached-password screening and MFA in place' $script:GpoPathPwd 'MaximumPasswordAge|Maximum password age')
         (New-RecSetting 'Minimum password age'                                     '1 day'                                 $script:GpoPathPwd 'MinimumPasswordAge|Minimum password age')
         (New-RecSetting 'Store passwords using reversible encryption'              'Disabled'                              $script:GpoPathPwd 'ClearTextPassword|reversible encryption')
     )
@@ -966,17 +976,41 @@ function Get-GpoScope {
         }
     }
 
-    $applyTo   = @()
-    $denyApply = @()
-    $editors   = @()
+    $applyTo    = @()
+    $denyApply  = @()
+    $editors    = @()
+    $applyDet   = @()   # same principals, with the type AD reports for them
+    $denyDet    = @()
     try {
         $perms = Get-GPPermission -Guid $Gpo.Id -All @GpParams
         foreach ($p in $perms) {
             $trustee = $p.Trustee.Name
             if (-not $trustee) { $trustee = $p.Trustee.Sid.Value }
+
+            $ttype = 'Principal'
+            try {
+                switch -Wildcard ("$($p.Trustee.SidType)") {
+                    'User'            { $ttype = 'User' }
+                    'Computer'        { $ttype = 'Computer' }
+                    'Group'           { $ttype = 'Group' }
+                    'WellKnownGroup'  { $ttype = 'Group' }
+                    'LocalGroup'      { $ttype = 'Group' }
+                    default           { $ttype = 'Principal' }
+                }
+            }
+            catch { $ttype = 'Principal' }
+            if ($trustee -like '*$') { $ttype = 'Computer' }
+
             switch -Wildcard ("$($p.Permission)") {
                 'GpoApply' {
-                    if ($p.Denied) { $denyApply += $trustee } else { $applyTo += $trustee }
+                    if ($p.Denied) {
+                        $denyApply += $trustee
+                        $denyDet   += [pscustomobject]@{ Name = $trustee; Type = $ttype }
+                    }
+                    else {
+                        $applyTo  += $trustee
+                        $applyDet += [pscustomobject]@{ Name = $trustee; Type = $ttype }
+                    }
                 }
                 'GpoEdit*' { if (-not $p.Denied) { $editors += $trustee } }
             }
@@ -990,9 +1024,11 @@ function Get-GpoScope {
     try { if ($Gpo.WmiFilter) { $wmi = $Gpo.WmiFilter.Name } } catch { $wmi = $null }
 
     [pscustomobject]@{
-        Links        = $links
-        ApplyTo      = $applyTo
-        DenyApply    = $denyApply
+        Links          = $links
+        ApplyTo        = $applyTo
+        DenyApply      = $denyApply
+        ApplyToDetail  = $applyDet
+        DenyApplyDetail = $denyDet
         Editors      = ($editors | Select-Object -Unique)
         WmiFilter    = $wmi
         Status       = "$($Gpo.GpoStatus)"
@@ -1480,10 +1516,14 @@ function Get-ScheduleSummary {
 
 function Get-UserLogonRestrictions {
     <#
-      Every user account that is limited in WHEN it may sign in (logonHours),
-      WHERE it may sign in from (logonWorkstations), or UNTIL when the account
-      is valid (accountExpires). Users with none of the three are counted but
-      not listed.
+      Every user account, with whatever limits it carries on WHEN it may sign
+      in (logonHours), WHERE it may sign in from (logonWorkstations), and UNTIL
+      when the account is valid (accountExpires).
+
+      Returns both lists: .Rows is the accounts that carry at least one of the
+      three (what the nav count, the CSV and the drift snapshot mean by a
+      "restriction"), and .AllRows is every account scanned, so the report can
+      also show who has NO restriction at all.
     #>
     param([string]$Server, [int]$OffsetHours)
 
@@ -1514,8 +1554,6 @@ function Get-UserLogonRestrictions {
         $ep = $u.PSObject.Properties['AccountExpirationDate']
         if ($ep -and $ep.Value) { $exp = $ep.Value }
 
-        if ($null -eq $map -and -not $ws -and $null -eq $exp) { continue }
-
         $rows += [pscustomobject]@{
             Name           = $u.Name
             Sam            = $u.SamAccountName
@@ -1527,12 +1565,18 @@ function Get-UserLogonRestrictions {
             NeverAllowed   = (($null -ne $map) -and ($allowed -eq 0))
             Workstations   = $ws
             Expires        = $exp
+            Restricted     = (($null -ne $map) -or [bool]$ws -or ($null -ne $exp))
             LastLogon      = (Get-Prop $u 'LastLogonDate')
             Summary        = $(if ($map) { Get-ScheduleSummary -Map $map } else { 'Any hour of any day' })
         }
     }
 
-    [pscustomobject]@{ Total = $users.Count; Rows = @($rows | Sort-Object Name) }
+    $sorted = @($rows | Sort-Object Name)
+    [pscustomobject]@{
+        Total   = $users.Count
+        Rows    = @($sorted | Where-Object { $_.Restricted })
+        AllRows = $sorted
+    }
 }
 
 # ------------------------------------------------- privileged group report --
@@ -1799,6 +1843,7 @@ foreach ($gpo in $allGpos) {
         Write-Warn ("Could not read scope for '{0}': {1}" -f $gpo.DisplayName, $_.Exception.Message)
         $scope = [pscustomobject]@{
             Links = @(); ApplyTo = @(); DenyApply = @(); Editors = @(); WmiFilter = $null
+            ApplyToDetail = @(); DenyApplyDetail = @()
             Status = "$($gpo.GpoStatus)"; Owner = ''; Created = $null; Modified = $null
             CompVersion = ''; UserVersion = ''
         }
@@ -2335,6 +2380,347 @@ else { $userInv.Error = $script:AdSkipReason }
 
 # ------------------------------------------------------- service accounts ---
 
+# ======================================== mass storage / removable media ====
+
+# Setting names that RESTRICT removable media, and names that PERMIT it. The
+# name decides which family a setting is in; its VALUE then decides which way
+# it actually lands (a "Deny all access" set to Disabled permits, it does not
+# restrict).
+$script:MsDenyNames = 'Deny all access|Deny write access|Deny read access|Deny execute access|' +
+    'Removable Disks: Deny|CD and DVD: Deny|Floppy Drives: Deny|Tape Drives: Deny|WPD Devices: Deny|' +
+    'Custom Classes: Deny|Prevent installation of devices|Restrict CD-ROM access|Restrict floppy access|' +
+    'Portable Operating System|USBSTOR'
+$script:MsAllowNames = 'Allow administrators to override|Allow installation of devices|' +
+    'Allow direct access in remote sessions|Allow access to removable|Allow remote access to removable|' +
+    'Allowed to format and eject removable media'
+
+function Get-MsSettingEffect {
+    <#
+      Restrict / Allow / Note for one removable-storage setting. "Note" means
+      the setting is in scope for this area but does not by itself open or
+      close access, so it is listed without being counted either way.
+    #>
+    param([string]$Name, [string]$Value)
+
+    $v = "$Value"
+
+    if ($Name -match 'USBSTOR') {
+        if ($v -match '\b4\b|Disabled')       { return 'Restrict' }
+        if ($v -match '\b3\b|Manual|Automatic') { return 'Allow' }
+        return 'Note'
+    }
+    if ($Name -match $script:MsAllowNames) {
+        if ($v -match '^\s*Disabled')  { return 'Note' }
+        return 'Allow'
+    }
+    if ($Name -match $script:MsDenyNames) {
+        if ($v -match '^\s*Disabled')  { return 'Allow' }
+        if ($v -match 'Not configured'){ return 'Note' }
+        return 'Restrict'
+    }
+    return 'Note'
+}
+
+# ============================================= password policy evaluation ===
+
+function Get-PwdNumber {
+    <# First whole number in a Group Policy value string: "8 characters" -> 8. #>
+    param([string]$Value)
+    if ($Value -match '(-?\d+)') { return [int]$Matches[1] }
+    return $null
+}
+
+function Get-PasswordPolicyState {
+    <#
+      Minimum length and maximum age as the APPLYING GPOs set them, measured
+      against the two profiles. Returns one object per policy - the domain
+      policy, plus one per fine-grained password policy - because administrators
+      are usually governed by a PSO rather than the domain policy.
+    #>
+    param($PwdHits, $Psos)
+
+    $out = @()
+
+    # Password policy only takes effect from a GPO linked at the DOMAIN ROOT, so
+    # prefer those hits; anything else is read as a fallback and named in Source.
+    $rootPath = "$Domain"
+    $lenHit = @(@($PwdHits | Where-Object { $_.Applying -and $_.Name -match 'MinimumPasswordLength|Minimum password length' }) |
+                    Sort-Object @{ Expression = { if ("$($_.LinkPaths)" -eq $rootPath) { 0 } else { 1 } } })
+    $ageHit = @(@($PwdHits | Where-Object { $_.Applying -and $_.Name -match 'MaximumPasswordAge|Maximum password age' }) |
+                    Sort-Object @{ Expression = { if ("$($_.LinkPaths)" -eq $rootPath) { 0 } else { 1 } } })
+
+    $len = if ($lenHit.Count -gt 0) { Get-PwdNumber $lenHit[0].Value } else { $null }
+    $age = if ($ageHit.Count -gt 0) { Get-PwdNumber $ageHit[0].Value } else { $null }
+    $src = @(@($lenHit + $ageHit) | ForEach-Object { $_.Gpo } | Select-Object -Unique)
+
+    $out += [pscustomobject]@{
+        Scope     = 'Domain password policy'
+        AppliesTo = 'Every account not covered by a fine-grained policy'
+        Source    = $(if ($src.Count -gt 0) { ($src -join '; ') } else { '' })
+        MinLength = $len
+        MaxAge    = $age
+    }
+
+    foreach ($p in @($Psos)) {
+        $pAge = $null
+        try { if ($null -ne $p.MaxAge) { $pAge = [int]([timespan]$p.MaxAge).TotalDays } } catch { $pAge = $null }
+        $out += [pscustomobject]@{
+            Scope     = ('Fine-grained policy: {0}' -f $p.Name)
+            AppliesTo = $(if ($p.AppliesTo) { [string]$p.AppliesTo } else { '(no principals assigned)' })
+            Source    = 'Active Directory PSO'
+            MinLength = $(try { [int]$p.MinLength } catch { $null })
+            MaxAge    = $pAge
+        }
+    }
+
+    foreach ($o in $out) {
+        $gaps = @()
+        $lenOk = ($null -ne $o.MinLength) -and ($o.MinLength -ge $script:PwdMinLength)
+        if ($null -eq $o.MinLength) {
+            $gaps += 'Minimum password length is not set by any applying policy'
+        }
+        elseif (-not $lenOk) {
+            $gaps += ('Minimum password length is {0} characters, below the recommended {1}' -f $o.MinLength, $script:PwdMinLength)
+        }
+
+        # examiner profile: expires, and at least once a year
+        $ageExaminerOk = ($null -ne $o.MaxAge) -and ($o.MaxAge -gt 0) -and ($o.MaxAge -le $script:PwdExaminerMaxAge)
+        # NIST profile: does not expire at all
+        $ageNistOk     = ($null -ne $o.MaxAge) -and ($o.MaxAge -eq $script:PwdNistMaxAge)
+
+        if ($null -eq $o.MaxAge) {
+            $gaps += 'Maximum password age is not set by any applying policy'
+        }
+        elseif ($o.MaxAge -gt $script:PwdExaminerMaxAge) {
+            $gaps += ('Maximum password age is {0} days, longer than the recommended {1}' -f $o.MaxAge, $script:PwdExaminerMaxAge)
+        }
+        elseif ($o.MaxAge -eq 0) {
+            $gaps += 'Passwords never expire, which meets the NIST profile but not the examiner profile'
+        }
+
+        Add-Member -InputObject $o -NotePropertyName 'LengthOk'   -NotePropertyValue $lenOk
+        Add-Member -InputObject $o -NotePropertyName 'ExaminerOk' -NotePropertyValue ($lenOk -and $ageExaminerOk)
+        Add-Member -InputObject $o -NotePropertyName 'NistOk'     -NotePropertyValue ($lenOk -and $ageNistOk)
+        Add-Member -InputObject $o -NotePropertyName 'Gaps'       -NotePropertyValue @($gaps)
+        Add-Member -InputObject $o -NotePropertyName 'LengthText' -NotePropertyValue `
+            $(if ($null -eq $o.MinLength) { 'Not configured' } else { ('{0} characters' -f $o.MinLength) })
+        Add-Member -InputObject $o -NotePropertyName 'AgeText'    -NotePropertyValue `
+            $(if ($null -eq $o.MaxAge) { 'Not configured' }
+              elseif ($o.MaxAge -eq 0) { 'Never expires' }
+              else { ('{0} days' -f $o.MaxAge) })
+    }
+
+    @($out)
+}
+
+function Add-PasswordSuggestion {
+    <#
+      Shown in focus area A when a policy meets neither profile. Gives the
+      examiner option and the NIST option side by side, because the two cannot
+      both be satisfied and the institution has to choose one.
+    #>
+    param($States)
+
+    $bad = @($States | Where-Object { -not $_.ExaminerOk })
+    if ($bad.Count -eq 0) { return }
+
+    A '<details class="sugg" open>'
+    A ("<summary>Recommendation &ndash; password policy does not meet the examiner profile ({0} of {1} policies)</summary>" -f $bad.Count, @($States).Count)
+    A '<div class="suggbody">'
+
+    A '<p>Two profiles are in common use and they cannot both be satisfied, because one requires passwords to expire and the other requires that they do not. Pick one, write it into the institution&rsquo;s password policy, and configure Active Directory to match.</p>'
+
+    A '<table class="psotbl"><tr><th>Policy</th><th>Applies to</th><th>Minimum length</th><th>Maximum age</th><th>Examiner profile</th><th>NIST profile</th></tr>'
+    foreach ($s in @($States)) {
+        A ("<tr><td>{0}<div class='where'>{1}</div></td><td class='where'>{2}</td><td class='{7}'>{3}</td><td class='{8}'>{4}</td><td>{5}</td><td>{6}</td></tr>" -f `
+            (HtmlEnc $s.Scope), (HtmlEnc $s.Source), (HtmlEnc $s.AppliesTo),
+            (HtmlEnc $s.LengthText), (HtmlEnc $s.AgeText),
+            $(if ($s.ExaminerOk) { '<span class="badge ok">Met</span>' } else { '<span class="badge bad">Not met</span>' }),
+            $(if ($s.NistOk)     { '<span class="badge ok">Met</span>' } else { '<span class="badge warn">Not met</span>' }),
+            $(if ($s.LengthOk) { '' } else { 'bad' }),
+            $(if ($s.ExaminerOk -or $s.NistOk) { '' } else { 'bad' }))
+    }
+    A '</table>'
+
+    A '<h5>Option 1 &ndash; the banking examiner profile</h5>'
+    A ("<div class='hint' style='margin-left:0'>Minimum password length <b>{0} characters</b> and maximum password age <b>{1} days or less</b>, for users and administrators alike. This keeps a defined expiry on the books, which is what examiners have historically looked for, while moving away from the 60 and 90 day cycles that drive users to predictable password patterns. Apply it to administrators through a fine-grained password policy if their standard is stricter than the domain&rsquo;s.</div>" -f `
+        $script:PwdMinLength, $script:PwdExaminerMaxAge)
+
+    A '<h5>Option 2 &ndash; the NIST profile</h5>'
+    A ("<div class='hint' style='margin-left:0'>Minimum password length <b>{0} characters</b> and maximum password age <b>0, meaning passwords do not expire</b>. NIST SP 800-63B recommends against routine expiry because forced rotation produces weaker, more predictable passwords. It allows this only alongside compensating controls, and an examiner will ask for them: screen new passwords against a list of known-compromised passwords, force a change whenever there is evidence of compromise, and require multi-factor authentication. Do not remove expiry without those in place and documented, or the control reads as weaker rather than modern.</div>" -f `
+        $script:PwdMinLength)
+
+    A '<h5>Where to set it in Group Policy</h5>'
+    A '<ol>'
+    A '<li>Edit the GPO linked at the <b>domain root</b> &ndash; password policy applies to the domain from there, not from an OU.</li>'
+    A ("<li>Browse to <code>{0}</code>.</li>" -f (HtmlEnc ($script:GpoPathPwd -replace ' > ', ' &rarr; ')))
+    A ("<li>Set <code>Minimum password length</code> to <b>{0}</b>.</li>" -f $script:PwdMinLength)
+    A ("<li>Set <code>Maximum password age</code> to <b>{0}</b> for the examiner profile, or to <b>0</b> for the NIST profile.</li>" -f $script:PwdExaminerMaxAge)
+    A '<li>For administrators, set the same values on their fine-grained password policy so the two do not drift apart.</li>'
+    A '</ol>'
+    A '<div class="cite">A maximum password age of 0 means the password never expires. Confirm the choice with the institution&rsquo;s written information security policy before changing it, so the policy document and the directory agree.</div>'
+    A '</div></details>'
+}
+
+function New-MsRow {
+    <# One "who is affected" row for the mass storage view. #>
+    param([string]$Target, [string]$Type, [string]$Effect, [string]$Why, $First, [bool]$InForce, [string]$Settings)
+    [pscustomobject]@{
+        Target   = $Target
+        Type     = $Type
+        Effect   = $Effect
+        Why      = $Why
+        Gpo      = $First.Gpo
+        Anchor   = $First.Anchor
+        InForce  = $InForce
+        Settings = $Settings
+    }
+}
+
+function Get-MassStorageReview {
+    <#
+      Who removable storage is restricted for, and who is let off it. One row
+      per GPO x target, where a target is a container the GPO is linked to, a
+      principal in its security filtering, a principal explicitly denied Apply,
+      or a WMI filter that narrows it further. Targets may be computers, users,
+      groups, organizational units or a mix - that is what the Type column is.
+    #>
+    param($UsbHits)
+
+    $rows = @()
+    $gpoCards = @()
+
+    foreach ($grp in @($UsbHits | Group-Object Anchor)) {
+
+        $first = $grp.Group[0]
+        $sc    = $first.Scope
+        $sets  = @($grp.Group)
+
+        $classified = @()
+        foreach ($s in $sets) {
+            $classified += [pscustomobject]@{
+                Side   = $s.Side
+                Name   = $s.Name
+                Value  = $s.Value
+                Effect = (Get-MsSettingEffect -Name $s.Name -Value $s.Value)
+            }
+        }
+        $restrictSets = @($classified | Where-Object { $_.Effect -eq 'Restrict' })
+        $allowSets    = @($classified | Where-Object { $_.Effect -eq 'Allow' })
+
+        $activeLinks = @($sc.Links | Where-Object { $_.Enabled -eq 'true' })
+        $inForce     = ($activeLinks.Count -gt 0) -and ($sc.Status -ne 'AllSettingsDisabled')
+
+        $notInForceWhy = ''
+        if (-not $inForce) {
+            $notInForceWhy = if ($sc.Status -eq 'AllSettingsDisabled') { 'the GPO status is All settings disabled' }
+                             elseif (@($sc.Links).Count -eq 0)          { 'the GPO is not linked to any container' }
+                             else                                       { 'every link on the GPO is disabled' }
+        }
+
+        # what this GPO does when it does apply
+        $verdict = if ($restrictSets.Count -gt 0) { 'Restricted' } else { 'Allowed' }
+
+        $settingText = @($classified | ForEach-Object { '{0} = {1}' -f $_.Name, $_.Value })
+
+        $gpoCards += [pscustomobject]@{
+            Gpo        = $first.Gpo
+            Anchor     = $first.Anchor
+            InForce    = $inForce
+            Why        = $notInForceWhy
+            Verdict    = $verdict
+            Settings   = $classified
+            Restricts  = $restrictSets.Count
+            Allows     = $allowSets.Count
+        }
+
+        $setText = ($settingText -join ' | ')
+        $bag = @()
+
+        # ---- the containers it is linked to
+        if (@($sc.Links).Count -eq 0) {
+            $bag += (New-MsRow '(not linked to any container)' 'Container' 'Allowed' `
+                'The GPO is not linked anywhere, so nothing it configures is in force' $first $inForce $setText)
+        }
+        foreach ($l in @($sc.Links)) {
+            if ($l.Enabled -ne 'true') {
+                $bag += (New-MsRow $l.SOMPath 'Container' 'Allowed' `
+                    'The link to this container is disabled, so the GPO does not apply here' $first $inForce $setText)
+            }
+            elseif (-not $inForce) {
+                $bag += (New-MsRow $l.SOMPath 'Container' 'Allowed' `
+                    ('Configured but not in force: {0}' -f $notInForceWhy) $first $inForce $setText)
+            }
+            elseif ($verdict -eq 'Restricted') {
+                $bag += (New-MsRow $l.SOMPath 'Container' 'Restricted' `
+                    ('Removable storage is denied for everything in this container{0}' -f `
+                        $(if ($l.Enforced -eq 'true') { ', and the link is enforced' } else { '' })) $first $inForce $setText)
+            }
+            else {
+                $bag += (New-MsRow $l.SOMPath 'Container' 'Allowed' `
+                    'The GPO applies here but only permits removable storage' $first $inForce $setText)
+            }
+        }
+
+        # ---- the principals the GPO is filtered to
+        foreach ($p in @($sc.ApplyToDetail)) {
+            if (-not $inForce) {
+                $bag += (New-MsRow $p.Name $p.Type 'Allowed' `
+                    ('Configured but not in force: {0}' -f $notInForceWhy) $first $inForce $setText)
+            }
+            elseif ($verdict -eq 'Restricted') {
+                $bag += (New-MsRow $p.Name $p.Type 'Restricted' `
+                    'In the security filtering, so the deny settings reach it' $first $inForce $setText)
+            }
+            else {
+                $bag += (New-MsRow $p.Name $p.Type 'Allowed' `
+                    'In the security filtering of a GPO that only permits removable storage' $first $inForce $setText)
+            }
+        }
+
+        # ---- the principals explicitly let off
+        foreach ($p in @($sc.DenyApplyDetail)) {
+            $bag += (New-MsRow $p.Name $p.Type 'Exception' `
+                $(if ($verdict -eq 'Restricted') { 'Explicit Deny on "Apply group policy" - this restriction does not reach it' }
+                  else { 'Explicit Deny on "Apply group policy"' }) $first $inForce $setText)
+        }
+
+        # ---- a WMI filter narrows it further
+        if ($sc.WmiFilter -and $verdict -eq 'Restricted' -and $inForce) {
+            $bag += (New-MsRow $sc.WmiFilter 'WMI filter' 'Exception' `
+                'Targets are narrowed by this WMI filter - any machine that does not match is not restricted' `
+                $first $inForce $setText)
+        }
+
+        $rows += @($bag)
+    }
+
+    # exceptions first, then allowed, then restricted - the review order
+    $msOrder = @{ 'Exception' = 0; 'Allowed' = 1; 'Restricted' = 2 }
+    foreach ($r in $rows) {
+        $rank = 3
+        if ($msOrder.ContainsKey($r.Effect)) { $rank = $msOrder[$r.Effect] }
+        Add-Member -InputObject $r -NotePropertyName 'Rank' -NotePropertyValue $rank
+    }
+
+    [pscustomobject]@{
+        Rows     = @($rows | Sort-Object Rank, Type, Target)
+        Gpos     = @($gpoCards | Sort-Object Gpo)
+        AnyForce = (@($gpoCards | Where-Object { $_.InForce -and $_.Verdict -eq 'Restricted' }).Count -gt 0)
+    }
+}
+
+$pwdStates = @()
+try { $pwdStates = @(Get-PasswordPolicyState -PwdHits @($focus['pwd']) -Psos @($psos)) }
+catch { Write-Warn ("Password policy evaluation failed: {0}" -f $_.Exception.Message) }
+
+$msReview = $null
+try { $msReview = Get-MassStorageReview -UsbHits @($focus['usb']) }
+catch { Write-Warn ("Mass storage review failed: {0}" -f $_.Exception.Message) }
+if ($null -eq $msReview) {
+    $msReview = [pscustomobject]@{ Rows = @(); Gpos = @(); AnyForce = $false }
+}
+
 $svcReview = $null
 if (-not $SkipServiceAccounts -and $adAvailable) {
     Write-Step 'Reviewing service accounts and interactive logon restrictions'
@@ -2637,11 +3023,13 @@ function applyLogonFilter(){
     var ok = (term === '') || norm(u.dataset.k).indexOf(term) >= 0;
     if (ok && !incDisabled && u.dataset.enabled === '0') ok = false;
     if (ok) {
-      if (mode === 'hours' && u.dataset.hours !== '1') ok = false;
-      if (mode === 'never' && u.dataset.never !== '1') ok = false;
-      if (mode === 'ws'    && u.dataset.ws    !== '1') ok = false;
-      if (mode === 'exp'   && u.dataset.exp   !== '1') ok = false;
-      if (mode === 'dis'   && u.dataset.enabled !== '0') ok = false;
+      if (mode === 'restr'   && u.dataset.restr !== '1') ok = false;
+      if (mode === 'hours'   && u.dataset.hours !== '1') ok = false;
+      if (mode === 'nohours' && u.dataset.hours === '1') ok = false;
+      if (mode === 'never'   && u.dataset.never !== '1') ok = false;
+      if (mode === 'ws'      && u.dataset.ws    !== '1') ok = false;
+      if (mode === 'exp'     && u.dataset.exp   !== '1') ok = false;
+      if (mode === 'dis'     && u.dataset.enabled !== '0') ok = false;
     }
     u.style.display = ok ? '' : 'none';
     if (ok) n++;
@@ -2651,6 +3039,38 @@ function applyLogonFilter(){
   document.querySelectorAll('#view-logon .statf').forEach(function(s){
     s.classList.toggle('on', s.dataset.f === mode && s.dataset.dis === box);
   });
+}
+function applyMsFilter(){
+  var q = document.getElementById('qMs');
+  if (!q) return;
+  var term = norm(q.value).trim();
+  var mode = document.getElementById('fMs').value;
+  var kind = document.getElementById('fMsKind').value;
+  var n = 0;
+  document.querySelectorAll('#tbl-ms .msrow').forEach(function(r){
+    var ok = (term === '') || norm(r.dataset.k).indexOf(term) >= 0;
+    if (ok && kind !== 'any' && r.dataset.kind !== kind) ok = false;
+    if (ok) {
+      if (mode === 'open'  && r.dataset.eff === 'Restricted') ok = false;
+      if (mode === 'exc'   && r.dataset.eff !== 'Exception')  ok = false;
+      if (mode === 'allow' && r.dataset.eff !== 'Allowed')    ok = false;
+      if (mode === 'restr' && r.dataset.eff !== 'Restricted') ok = false;
+    }
+    r.style.display = ok ? '' : 'none';
+    if (ok) n++;
+  });
+  var c = document.getElementById('cnt-ms');
+  if (c) c.textContent = n;
+  document.querySelectorAll('#view-massstorage .statf').forEach(function(s){
+    s.classList.toggle('on', s.dataset.f === mode && s.dataset.k === kind);
+  });
+}
+function setMsFilter(mode, kind){
+  var sel = document.getElementById('fMs');
+  if (!sel) return;
+  sel.value = mode;
+  document.getElementById('fMsKind').value = kind || 'any';
+  applyMsFilter();
 }
 function setLogonFilter(mode, dis){
   var sel = document.getElementById('fLogon');
@@ -2870,6 +3290,18 @@ document.addEventListener('DOMContentLoaded', function(){
     document.getElementById('qSvc').addEventListener('input', applySvcFilter);
     document.getElementById('fSvcUn').addEventListener('change', applySvcFilter);
   }
+  if (document.getElementById('qMs')) {
+    document.getElementById('qMs').addEventListener('input', applyMsFilter);
+    document.getElementById('fMs').addEventListener('change', applyMsFilter);
+    document.getElementById('fMsKind').addEventListener('change', applyMsFilter);
+    document.querySelectorAll('#view-massstorage .statf').forEach(function(s){
+      s.addEventListener('click', function(){ setMsFilter(s.dataset.f, s.dataset.k); });
+      s.addEventListener('keydown', function(e){
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMsFilter(s.dataset.f, s.dataset.k); }
+      });
+    });
+    applyMsFilter();
+  }
   if (document.getElementById('qLogon')) {
     document.getElementById('qLogon').addEventListener('input', applyLogonFilter);
     document.getElementById('fLogon').addEventListener('change', applyLogonFilter);
@@ -3083,6 +3515,7 @@ A ("<a class='nav' data-view='logon' href='#'>Logon restrictions<span class='n'>
 $svcCount = '&ndash;'
 if ($svcReview.Checked) { $svcCount = @($svcReview.Accounts).Count }
 A ("<a class='nav' data-view='svcacct' href='#'>Service accounts<span class='n'>{0}</span></a>" -f $svcCount)
+A ("<a class='nav' data-view='massstorage' href='#'>Mass storage<span class='n'>{0}</span></a>" -f @($msReview.Rows).Count)
 
 A '<div class="grouplbl">Inventory</div>'
 A ("<a class='nav' data-view='gpos' href='#'>All GPOs<span class='n'>{0}</span></a>" -f $records.Count)
@@ -3185,6 +3618,7 @@ foreach ($fa in $script:FocusAreas) {
         elseif ($adAvailable) {
             A '<div class="note">No fine-grained password policies are defined &ndash; administrators are subject to the same domain password policy as everyone else.</div>'
         }
+        Add-PasswordSuggestion -States $pwdStates
     }
 
     A '</div>'
@@ -3194,7 +3628,7 @@ A '</section>'
 # ================================================= VIEW: LOGON RESTRICTIONS ==
 A '<section class="view" id="view-logon">'
 A '<h1>User logon restrictions</h1>'
-A '<div class="sub">When an account may sign in (logonHours), which computers it may sign in from (logonWorkstations), and when the account expires. These are per-USER attributes in Active Directory, not Group Policy settings, so they are read from AD rather than from the GPOs.</div>'
+A '<div class="sub">When an account may sign in (logonHours), which computers it may sign in from (logonWorkstations), and when the account expires. These are per-USER attributes in Active Directory, not Group Policy settings, so they are read from AD rather than from the GPOs. Every user account was examined and every one is listed here; the view opens on the accounts that carry a restriction, and the tiles below switch it to any other slice &ndash; including the accounts with no time restriction at all.</div>'
 A '<div style="height:14px"></div>'
 
 if (-not $adAvailable) {
@@ -3205,29 +3639,34 @@ elseif ($null -eq $logonScan) {
 }
 else {
 
-    $lrAll   = @($logonScan.Rows)
-    $lrHours = @($lrAll | Where-Object { $_.HourRestricted })
-    $lrNever = @($lrAll | Where-Object { $_.NeverAllowed })
-    $lrWs    = @($lrAll | Where-Object { $_.Workstations })
-    $lrExp   = @($lrAll | Where-Object { $null -ne $_.Expires })
-    $lrDis   = @($lrAll | Where-Object { -not $_.Enabled })
-    $lrLive  = @($lrAll | Where-Object { $_.Enabled })
+    $lrEvery = @($logonScan.AllRows)
+    $lrAll   = @($logonScan.Rows)                                      # restricted only
+    $lrLiveAll = @($lrEvery | Where-Object { $_.Enabled })
+    $lrDisAll  = @($lrEvery | Where-Object { -not $_.Enabled })
+    $lrDis   = @($lrAll | Where-Object { -not $_.Enabled })            # restricted AND disabled
+    $lrLive  = @($lrLiveAll | Where-Object { $_.Restricted })
+    $lrHours = @($lrLiveAll | Where-Object { $_.HourRestricted })
+    $lrNoHrs = @($lrLiveAll | Where-Object { -not $_.HourRestricted })
+    $lrNever = @($lrLiveAll | Where-Object { $_.NeverAllowed })
+    $lrWs    = @($lrLiveAll | Where-Object { $_.Workstations })
+    $lrExp   = @($lrLiveAll | Where-Object { $null -ne $_.Expires })
 
     A '<div class="stats">'
-    if ($lrAll.Count -gt 0) {
-        A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter the list below.</div>'
+    if ($lrEvery.Count -gt 0) {
+        A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter the list below. Each number is exactly what that tile shows.</div>'
     }
     $lrTiles = @(
-        @{ N = $logonScan.Total; L = 'Users examined';         F = 'all';   D = '1'; T = 'Show every restricted account, including disabled ones' },
-        @{ N = $lrLive.Count;    L = 'Restricted &amp; enabled'; F = 'all'; D = '0'; T = 'Show the enabled accounts that carry a restriction' },
-        @{ N = $lrHours.Count;   L = 'Hour restricted';        F = 'hours'; D = '0'; T = 'Show only accounts limited by logon hours' },
-        @{ N = $lrNever.Count;   L = 'Can never sign in';      F = 'never'; D = '0'; T = 'Show only accounts whose schedule denies every hour' },
-        @{ N = $lrWs.Count;      L = 'Workstation restricted'; F = 'ws';    D = '0'; T = 'Show only accounts limited to named computers' },
-        @{ N = $lrExp.Count;     L = 'Account expires';        F = 'exp';   D = '0'; T = 'Show only accounts with an expiry date' },
-        @{ N = $lrDis.Count;     L = 'Disabled (hidden)';      F = 'dis';   D = '1'; T = 'Show only the disabled accounts that carry a restriction' }
+        @{ N = $lrEvery.Count;    L = 'Users examined';           F = 'all';     D = '1'; T = 'Show every user account in the domain, including disabled ones' },
+        @{ N = $lrLive.Count;     L = 'Restricted &amp; enabled'; F = 'restr';   D = '0'; T = 'Show the enabled accounts that carry a restriction' },
+        @{ N = $lrHours.Count;    L = 'Hour restricted';          F = 'hours';   D = '0'; T = 'Show only accounts limited by logon hours' },
+        @{ N = $lrNoHrs.Count;    L = 'No time restriction';      F = 'nohours'; D = '0'; T = 'Show the enabled accounts that may sign in at any hour of any day' },
+        @{ N = $lrNever.Count;    L = 'Can never sign in';        F = 'never';   D = '0'; T = 'Show only accounts whose schedule denies every hour' },
+        @{ N = $lrWs.Count;       L = 'Workstation restricted';   F = 'ws';      D = '0'; T = 'Show only accounts limited to named computers' },
+        @{ N = $lrExp.Count;      L = 'Account expires';          F = 'exp';     D = '0'; T = 'Show only accounts with an expiry date' },
+        @{ N = $lrDisAll.Count;   L = 'Disabled accounts';        F = 'dis';     D = '1'; T = 'Show only the disabled accounts' }
     )
     foreach ($t in $lrTiles) {
-        if ($lrAll.Count -eq 0) {
+        if ($lrEvery.Count -eq 0) {
             A ("<div class='stat'><b>{0}</b><span>{1}</span></div>" -f $t.N, $t.L)
         }
         else {
@@ -3240,11 +3679,14 @@ else {
     if ($lrAll.Count -eq 0) {
         A '<div class="area">'
         A '<h3><span class="badge ok">Checked</span> No logon restrictions in this domain</h3>'
-        A ("<div class='hint' style='margin-left:0'>All {0} user accounts were examined. None is limited by logon hours, by workstation, or by an account expiry date &ndash; every account may sign in at any hour, from any computer, indefinitely.</div>" -f $logonScan.Total)
+        A ("<div class='hint' style='margin-left:0'>All {0} user accounts were examined. None is limited by logon hours, by workstation, or by an account expiry date &ndash; every account may sign in at any hour, from any computer, indefinitely. Click <b>Users examined</b> or <b>No time restriction</b> above to list them.</div>" -f $logonScan.Total)
         A '</div>'
     }
-    else {
-        A ("<div class='lhlegend'><span><i style='background:var(--accent)'></i>Sign-in allowed</span><span><i style='background:var(--chip)'></i>Sign-in denied</span><span>Each cell is one hour; rows are days, columns run 00:00 &rarr; 23:00 in <b>{0}</b>.</span></div>" -f (HtmlEnc $script:TzLabel))
+
+    if ($lrEvery.Count -gt 0) {
+        if ($lrAll.Count -gt 0) {
+            A ("<div class='lhlegend'><span><i style='background:var(--accent)'></i>Sign-in allowed</span><span><i style='background:var(--chip)'></i>Sign-in denied</span><span>Each cell is one hour; rows are days, columns run 00:00 &rarr; 23:00 in <b>{0}</b>.</span></div>" -f (HtmlEnc $script:TzLabel))
+        }
         if ($lrDis.Count -gt 0) {
             A ("<div class='sub' style='margin:-6px 0 12px'>{0} disabled account(s) also carry restrictions and are hidden below &ndash; tick <b>Include disabled accounts</b> to show them.</div>" -f $lrDis.Count)
         }
@@ -3252,21 +3694,23 @@ else {
         A '<div class="tblbar">'
         A '<input type="search" id="qLogon" placeholder="Filter by name, account, OU, workstation or schedule...">'
         A '<select id="fLogon">'
-        A '<option value="all">All restricted accounts</option>'
+        A '<option value="restr" selected>Restricted accounts only</option>'
+        A '<option value="all">All user accounts</option>'
         A '<option value="hours">Hour restricted</option>'
+        A '<option value="nohours">No time restriction</option>'
         A '<option value="never">Can never sign in</option>'
         A '<option value="ws">Workstation restricted</option>'
         A '<option value="exp">Account expires</option>'
         A '<option value="dis">Disabled accounts only</option>'
         A '</select>'
-        A ("<label style='color:var(--mut);display:flex;gap:6px;align-items:center;cursor:pointer'><input type='checkbox' id='fLogonDis'> Include disabled accounts ({0})</label>" -f $lrDis.Count)
+        A ("<label style='color:var(--mut);display:flex;gap:6px;align-items:center;cursor:pointer'><input type='checkbox' id='fLogonDis'> Include disabled accounts ({0})</label>" -f $lrDisAll.Count)
         A ("<span class='sub'><b id='cnt-logon'>{0}</b> shown</span>" -f $lrLive.Count)
         A ("<button type='button' class='btnCsv noprint' data-cards='tbl-logon' data-file='LogonRestrictions-{0}-{1}.csv'>Export this view to CSV</button>" -f `
             ($Domain -replace '[^\w\.\-]', '_'), (Get-Date -Format 'yyyyMMdd'))
         A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
 
         A ("<div id=""tbl-logon"" data-csvhead=""{0}"">" -f (HtmlEnc 'Name,Account,Enabled,OU,HourRestricted,NeverAllowed,AllowedHours,Schedule,Workstations,Expires,LastLogon'))
-        foreach ($lr in $lrAll) {
+        foreach ($lr in $lrEvery) {
 
             $k = (@($lr.Name, $lr.Sam, $lr.OU, $lr.Workstations, ($lr.Summary -replace '&middot;', ' ')) -join ' ')
 
@@ -3283,14 +3727,15 @@ else {
                 (Format-CsvField $(if ($lr.LastLogon) { ([datetime]$lr.LastLogon).ToString('yyyy-MM-dd') } else { 'Never' }))
             ) -join ',')
 
-            A ("<div class='lhuser' data-k='{0}' data-hours='{1}' data-never='{2}' data-ws='{3}' data-exp='{4}' data-enabled='{5}' data-csv='{6}'>" -f `
+            A ("<div class='lhuser' data-k='{0}' data-hours='{1}' data-never='{2}' data-ws='{3}' data-exp='{4}' data-enabled='{5}' data-restr='{7}' data-csv='{6}'>" -f `
                 (HtmlEnc $k),
                 $(if ($lr.HourRestricted) { '1' } else { '0' }),
                 $(if ($lr.NeverAllowed)   { '1' } else { '0' }),
                 $(if ($lr.Workstations)   { '1' } else { '0' }),
                 $(if ($null -ne $lr.Expires) { '1' } else { '0' }),
                 $(if ($lr.Enabled) { '1' } else { '0' }),
-                (HtmlEnc $lrCsv))
+                (HtmlEnc $lrCsv),
+                $(if ($lr.Restricted) { '1' } else { '0' }))
 
             A '<div class="lhwho"><h4>'
             A (HtmlEnc $lr.Name)
@@ -3298,6 +3743,7 @@ else {
             elseif ($lr.HourRestricted)  { A ("<span class='badge warn'>{0} of 168 hours</span>" -f $lr.AllowedHours) }
             if ($lr.Workstations)        { A '<span class="badge warn">Workstation limited</span>' }
             if ($null -ne $lr.Expires)   { A '<span class="badge warn">Expires</span>' }
+            if (-not $lr.Restricted)     { A '<span class="badge ok">No restriction</span>' }
             if (-not $lr.Enabled)        { A '<span class="badge bad">Disabled</span>' }
             A '</h4>'
             A ("<div class='sam'>{0}</div>" -f (HtmlEnc $lr.Sam))
@@ -3430,6 +3876,114 @@ else {
     A '<div class="missing" style="margin-left:0;font-weight:400">Leave <b>Log on as a service</b> and <b>Log on as a batch job</b> in place. Services and scheduled tasks need those rights &ndash; removing them stops the application.</div>'
     A '<h3 style="font-size:14px">Option 2 &ndash; convert it to a group Managed Service Account (gMSA)</h3>'
     A '<div class="hint" style="margin-left:0">Active Directory owns the password for a gMSA. It generates a 240-character random password, <b>rotates it automatically every 30 days by default</b>, and hands it only to the hosts you authorise. Nobody ever knows the password, it cannot be typed at a logon prompt, and it never has to be rotated by hand &ndash; which also removes the "password never expires" exception that service accounts usually carry.<br><br>The domain needs a KDS root key (created once), and the application has to support gMSA. SQL Server, IIS application pools and scheduled tasks do; many third-party applications do not. Where one does not, document the exception and rotate the password on a defined schedule.</div>'
+    A '</div>'
+}
+A '</section>'
+
+# ================================================== VIEW: MASS STORAGE =====
+A '<section class="view" id="view-massstorage">'
+A '<h1>Mass storage restrictions</h1>'
+A '<div class="sub">Who removable storage &ndash; USB mass storage, external drives, memory cards, optical and floppy media &ndash; is actually denied to, and who is let off it. A restriction only bites where a Group Policy Object is linked, enabled, and not filtered away, so each row names one target the policy reaches or misses. A target can be a container, a computer, a user, a group, or a WMI filter, and a domain normally has a mix.</div>'
+A '<div style="height:14px"></div>'
+
+$msRows = @($msReview.Rows)
+$msGpos = @($msReview.Gpos)
+
+if ($msGpos.Count -eq 0) {
+    A '<div class="missing" style="margin-left:0"><b>No Group Policy Object in this domain configures removable storage at all.</b> Nothing denies USB mass storage, external drives or optical media, so every computer and every user may read from and write to removable media. There is no exception list to review because there is no restriction to be excepted from.</div>'
+}
+else {
+    $msRestr = @($msRows | Where-Object { $_.Effect -eq 'Restricted' })
+    $msExc   = @($msRows | Where-Object { $_.Effect -eq 'Exception' })
+    $msAllow = @($msRows | Where-Object { $_.Effect -eq 'Allowed' })
+    $msOpen  = @($msRows | Where-Object { $_.Effect -ne 'Restricted' })
+    $msComp  = @($msRows | Where-Object { $_.Type -eq 'Computer' })
+    $msUser  = @($msRows | Where-Object { $_.Type -eq 'User' })
+    $msGrp   = @($msRows | Where-Object { $_.Type -eq 'Group' })
+    $msCont  = @($msRows | Where-Object { $_.Type -eq 'Container' })
+
+    if (-not $msReview.AnyForce) {
+        A ("<div class='missing' style='margin-left:0'><b>Removable storage is configured but nothing is enforcing it.</b> {0} GPO(s) carry removable-storage settings, but none of them is both linked and enabled, so no computer or user in the domain is actually denied removable media.</div>" -f $msGpos.Count)
+    }
+
+    A '<div class="stats">'
+    A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter the list below. The view opens on the exceptions and allowed usage.</div>'
+    $msTiles = @(
+        @{ N = $msOpen.Count;  L = 'Exceptions &amp; allowed'; F = 'open';  O = $true;  T = 'Targets that are NOT denied removable storage - explicit exceptions, and policy that is not in force' },
+        @{ N = $msExc.Count;   L = 'Explicit exceptions';      F = 'exc';   O = $false; T = 'Targets let off a restriction on purpose, by Deny on Apply group policy or by a WMI filter' },
+        @{ N = $msAllow.Count; L = 'Allowed by default';       F = 'allow'; O = $false; T = 'Targets a restriction does not reach because the GPO is unlinked, disabled, or only permits access' },
+        @{ N = $msRestr.Count; L = 'Restricted';               F = 'restr'; O = $false; T = 'Targets that an applying GPO actually denies removable storage to' },
+        @{ N = $msRows.Count;  L = 'All targets';              F = 'all';   O = $false; T = 'Every row, restricted and not' }
+    )
+    foreach ($t in $msTiles) {
+        A ("<div class='stat statf{5}' data-f='{2}' data-k='any' role='button' tabindex='0' title='{4}'><b>{0}</b><span>{1}</span></div>" -f `
+            $t.N, $t.L, $t.F, '', (HtmlEnc $t.T), $(if ($t.O) { ' on' } else { '' }))
+    }
+    A '</div>'
+
+    A '<div class="stats" style="margin-top:-6px">'
+    foreach ($k in @(
+            @{ N = $msCont.Count; L = 'Containers'; K = 'Container' },
+            @{ N = $msComp.Count; L = 'Computers';  K = 'Computer' },
+            @{ N = $msUser.Count; L = 'Users';      K = 'User' },
+            @{ N = $msGrp.Count;  L = 'Groups';     K = 'Group' })) {
+        A ("<div class='stat statf' data-f='all' data-k='{2}' role='button' tabindex='0' title='{3}'><b>{0}</b><span>{1}</span></div>" -f `
+            $k.N, $k.L, $k.K, (HtmlEnc ('Show every row whose target is a ' + $k.L.TrimEnd('s').ToLower())))
+    }
+    A '</div>'
+
+    A '<div class="tblbar">'
+    A '<input type="search" id="qMs" placeholder="Filter by target, GPO, setting or reason...">'
+    A '<select id="fMs">'
+    A '<option value="open" selected>Exceptions and allowed usage</option>'
+    A '<option value="exc">Explicit exceptions only</option>'
+    A '<option value="allow">Allowed by default only</option>'
+    A '<option value="restr">Restricted usage</option>'
+    A '<option value="all">Everything</option>'
+    A '</select>'
+    A '<select id="fMsKind">'
+    A '<option value="any">Any target type</option>'
+    A '<option value="Container">Containers</option>'
+    A '<option value="Computer">Computers</option>'
+    A '<option value="User">Users</option>'
+    A '<option value="Group">Groups</option>'
+    A '<option value="WMI filter">WMI filters</option>'
+    A '</select>'
+    A ("<span class='sub'><b id='cnt-ms'>{0}</b> shown</span>" -f $msOpen.Count)
+    A ("<button type='button' class='btnCsv noprint' data-table='tbl-ms' data-file='MassStorage-{0}-{1}.csv'>Export this view to CSV</button>" -f `
+        ($Domain -replace '[^\w\.\-]', '_'), (Get-Date -Format 'yyyyMMdd'))
+    A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
+
+    A '<table class="tbl" id="tbl-ms"><tr><th>Applies to</th><th>Type</th><th>Effect</th><th>Why</th><th>Group Policy Object</th><th>Removable-storage settings</th></tr>'
+    foreach ($m in $msRows) {
+        $k = (@($m.Target, $m.Type, $m.Effect, $m.Why, $m.Gpo, $m.Settings) -join ' ')
+        $eff = switch ($m.Effect) {
+            'Restricted' { '<span class="badge ok">Restricted</span>' }
+            'Exception'  { '<span class="badge bad">Exception</span>' }
+            default      { '<span class="badge warn">Allowed</span>' }
+        }
+        $setCell = ''
+        $parts = @("$($m.Settings)" -split ' \| ' | Where-Object { $_ })
+        foreach ($pp in @($parts | Select-Object -First 5)) {
+            $setCell += ("<div class='mut' style='font-size:11px'>{0}</div>" -f (HtmlEnc $pp))
+        }
+        if ($parts.Count -gt 5) {
+            $setCell += ("<div class='mut' style='font-size:11px'>+{0} more &ndash; see the GPO</div>" -f ($parts.Count - 5))
+        }
+        A ("<tr class='msrow' data-k='{0}' data-eff='{1}' data-kind='{2}'><td>{3}</td><td>{4}</td><td>{5}</td><td style='font-size:12px'>{6}</td><td><a href='#' onclick=""return gotoGpo('{7}')"">{8}</a>{9}</td><td>{10}</td></tr>" -f `
+            (HtmlEnc $k), (HtmlEnc $m.Effect), (HtmlEnc $m.Type),
+            (HtmlEnc $m.Target), (HtmlEnc $m.Type), $eff, (HtmlEnc $m.Why),
+            $m.Anchor, (HtmlEnc $m.Gpo),
+            $(if ($m.InForce) { '' } else { ' <span class="badge bad">not applying</span>' }),
+            $setCell)
+    }
+    A '</table>'
+
+    A '<h2>How to read this</h2>'
+    A '<div class="area" style="margin-top:8px">'
+    A '<div class="hint" style="margin-left:0"><b>Restricted</b> means an applying GPO denies removable storage to that target. <b>Exception</b> means someone was deliberately let off: an explicit Deny on "Apply group policy", or a WMI filter that narrows which machines the policy reaches. <b>Allowed</b> means the restriction never arrives &ndash; the GPO is unlinked, its link is disabled, its settings are disabled, or it only permits access.</div>'
+    A '<div class="missing" style="margin-left:0;font-weight:400">Exceptions are the list to take to the committee. Each one should have a named owner, a business reason and a review date, because an account or computer on this list can copy data to a USB drive while the written policy says nobody can.</div>'
+    A '<div class="hint" style="margin-left:0">This page reads Group Policy only. It does not detect removable-storage controls enforced by an endpoint agent, a DLP product or BitLocker To Go, so a target listed as allowed here may still be blocked by something outside Active Directory. Confirm against the tools in use before reporting it as a gap.</div>'
     A '</div>'
 }
 A '</section>'
@@ -3853,6 +4407,15 @@ $indexPath = Join-Path $reportDir ('{0}.html' -f $script:ReportName)
 if (-not $NoCsv) {
     Write-Step 'Writing CSV exports'
     $flatSettings | Export-Csv -Path (Join-Path $reportDir 'GPO-Settings.csv') -NoTypeInformation -Encoding UTF8
+
+    if (@($msReview.Rows).Count -gt 0) {
+        $msReview.Rows |
+            Select-Object @{ n = 'AppliesTo'; e = { $_.Target } }, Type, Effect, Why,
+                @{ n = 'GPO'; e = { $_.Gpo } },
+                @{ n = 'GpoApplying'; e = { if ($_.InForce) { 'Yes' } else { 'No' } } },
+                Settings |
+            Export-Csv -Path (Join-Path $reportDir 'MassStorage.csv') -NoTypeInformation -Encoding UTF8
+    }
     $flatScope    | Export-Csv -Path (Join-Path $reportDir 'GPO-Scope.csv')    -NoTypeInformation -Encoding UTF8
 
     if ($cleanup.Disabled.Count -gt 0) {
@@ -4371,6 +4934,29 @@ if (-not $SkipCommitteeReport) {
                 'Windows displays no banner unless both the message text and the message title are set.' `
                 $script:ControlMap['banner'] 'banner-partial'
         }
+    }
+
+    # password policy measured against the two profiles
+    $pwdBad = @($pwdStates | Where-Object { -not $_.ExaminerOk })
+    if ($pwdBad.Count -gt 0 -and @($pwdStates).Count -gt 0) {
+        $pwdNistMet = @($pwdBad | Where-Object { $_.NistOk })
+        $sev = if (@($pwdBad | Where-Object { -not $_.LengthOk }).Count -gt 0) { 'High' } else { 'Medium' }
+        $detail = ("{0} of {1} password policies in this domain do not meet the examiner profile of {2} characters and a maximum age of {3} days or less: {4}." -f `
+            $pwdBad.Count, @($pwdStates).Count, $script:PwdMinLength, $script:PwdExaminerMaxAge,
+            ((@($pwdBad | ForEach-Object { '{0} ({1}, {2})' -f $_.Scope, $_.LengthText, $_.AgeText }) -join '; ')))
+        if ($pwdNistMet.Count -gt 0) {
+            $detail += (" {0} of them already meet the NIST profile instead, because passwords do not expire." -f $pwdNistMet.Count)
+        }
+        Add-Finding $sev 'Password policy does not meet the examiner profile' $detail `
+            $script:ControlMap['pwd'] 'pwd-profile' `
+            (New-ListExhibit -Columns @('Policy', 'Applies to', 'Minimum length', 'Maximum age', 'Requested action') -Rows @(
+                $pwdBad | ForEach-Object { [pscustomobject]@{
+                    'Policy' = $_.Scope; 'Applies to' = $_.AppliesTo
+                    'Minimum length' = $_.LengthText; 'Maximum age' = $_.AgeText
+                    'Requested action' = ('Set minimum length to {0} characters, and maximum age to {1} days (examiner profile) or 0 / never (NIST profile)' -f `
+                        $script:PwdMinLength, $script:PwdExaminerMaxAge) } }) `
+                -Action ('Bring each policy to {0} characters, then choose one expiry profile for the whole institution: a maximum age of {1} days or less, or no expiry at all with breached-password screening and multi-factor authentication in place.' -f `
+                    $script:PwdMinLength, $script:PwdExaminerMaxAge))
     }
 
     # lockout disabled outright
