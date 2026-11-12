@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    AuditHat - Active Directory and Group Policy audit report. Version 3.18.0
+    AuditHat - Active Directory and Group Policy audit report. Version 3.20.1
     https://audithat.com
 
     Produces a detailed HTML review of every GPO in the domain, plus a separate
@@ -18,20 +18,48 @@
       LogonRestrictions.csv                       <- per-user logon limits
       ServiceAccounts.csv                         <- service accounts and their logon restriction
       AllUsers.csv                                <- every user account, for the auditor
+      AllComputers.csv                            <- every computer account
+      MassStorage.csv                             <- removable-storage restrictions and exceptions
+      MassStorage-Affected.csv                    <- every user and computer: denied, excepted or allowed
+      EntraIntune.csv                             <- what AD shows of Entra ID sync, hybrid join and Intune enrollment
+      Trusts.csv                                  <- every trust, with direction and SID filtering
+      CrossDomain-Accounts.csv / -Computers.csv   <- accounts and computers found in a second domain too
+      OtherDomain-Indicators.csv                  <- evidence of AD domains that are not connected
       Drift-Changes.csv                           <- every change in the drift window
       ad-snapshot.json                            <- state, for the next run's comparison
 
     The detailed report has a left navigation with separate views:
-      Focus areas       - which GPOs configure each area auditors ask about
-      Privileged groups - Administrators / Domain / Enterprise / Schema Admins
-      Logon restrictions- per-user logon hours (7x24 grid), workstations, expiry
-      Service accounts  - what looks like a service account, and whether it is
-                          restricted from interactive logon
-      All users         - the complete user account inventory
-      All GPOs          - the full nested inventory with search
-      Scope index       - every link in the domain, by container
-      Unlinked GPOs     - GPOs that are not applying anywhere
-      Cleanup           - disabled users, stale users, stale computers
+      Audit
+        Focus areas       - which GPOs configure each area auditors ask about
+        Privileged groups - Administrators / Domain / Enterprise / Schema Admins
+        Service accounts  - what looks like a service account, and whether it is
+                            restricted from interactive logon
+        Logon restrictions- per-user logon hours (7x24 grid), workstations, expiry
+        Mass storage      - who removable storage is denied to, and the exceptions,
+                            resolved down to every user and every computer
+      Domain structure
+        Forest & trusts   - where this domain sits in its forest, every trust and
+                            its direction, accounts from other domains holding
+                            privilege here, and evidence of unconnected domains
+        Domain comparison - this domain against a connected one: accounts and
+                            computers present in both, which domain each computer
+                            is joined to, policy side by side
+        Entra ID & Intune - directory sync, hybrid join, seamless SSO and the
+                            Intune auto-enrollment GPO, as far as AD records them
+      Inventory
+        All users         - the complete user account inventory
+        All computers     - the complete computer account inventory
+        All GPOs          - the full nested inventory with search
+        Scope index       - every link in the domain, by container
+        Unlinked GPOs     - GPOs that are not applying anywhere
+      Cleanup             - disabled users, stale users, stale computers
+
+    Group Policy does not cross a domain boundary: a GPO in one domain never
+    applies to another, parent or child. This report therefore covers ONE
+    domain. Where the domain has a parent, children or trusts, the report names
+    the connected domains so each can be scanned as well, and compares against
+    them when it can - live through the trust where the trust direction allows
+    it, otherwise from the other domain's ad-snapshot.json (-CompareSnapshot).
 
     The committee review is a separate, print-ready document: cover sheet,
     executive summary, item-level configuration drift over a fixed window
@@ -102,6 +130,22 @@
     committee review. Control-area and privileged-group drift are still
     reported. Use on very large domains if the snapshot file size matters.
 
+.PARAMETER CompareSnapshot
+    One or more paths to another domain's ad-snapshot.json (or to a folder that
+    holds one), produced by running this script in that domain. Used for the
+    Domain comparison view when the other domain cannot be read live through a
+    trust. Snapshots for other domains found under -OutputPath are picked up
+    automatically, so this is only needed when the file lives somewhere else.
+
+.PARAMETER SkipDomainStructure
+    Skip the forest, trust and cross-domain sections.
+
+.PARAMETER ProbeSubnets
+    Also look for domain controllers of OTHER domains by testing TCP 389 on
+    every address in this machine's local /24 subnet(s) and reading each
+    responder's public directory header. Read-only, but it is a port sweep and
+    may raise an IDS or SOC alert - off unless you ask for it.
+
 .PARAMETER NoCsv
     Skip the flat CSV exports.
 
@@ -113,6 +157,10 @@
 
 .EXAMPLE
     .\Export-ADAuditReport.ps1 -OutputPath D:\Audit -Name '*Baseline*' -ShowWhenDone
+
+.EXAMPLE
+    .\Export-ADAuditReport.ps1 -CompareSnapshot '\\fs01\audit\AD-Report-other.local-20261112\ad-snapshot.json'
+    Compare this domain with another one that was scanned separately.
 
 .NOTES
     Read-only. Requires GPO Read permission on every GPO you want reported
@@ -144,6 +192,9 @@ param(
     [ValidateRange(1, 3650)]
     [int]      $DriftDays = 30,
     [switch]   $SkipUserDrift,
+    [string[]] $CompareSnapshot,
+    [switch]   $SkipDomainStructure,
+    [switch]   $ProbeSubnets,
     [switch]   $NoCsv,
     [switch]   $ShowWhenDone
 )
@@ -206,7 +257,7 @@ $Branding = @{
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$script:ScriptVersion = '3.18.0'
+$script:ScriptVersion = '3.20.1'
 $script:ScriptName    = 'Export-ADAuditReport.ps1'
 
 # ---- resolve the branding block into what the rest of the script uses
@@ -488,6 +539,7 @@ $script:ControlMap = @{
     'logon'      = 'FFIEC IS II.C.7 User Security Controls; II.C.15 Logical Security | NIST CSF 2.0 PR.AA | CRI Profile PR.AA | CIS Controls v8 6.1, 6.2'
     'service'    = 'FFIEC IS II.C.7 User Security Controls (authentication, least privilege) | NIST CSF 2.0 PR.AA | CRI Profile PR.AA | CIS Controls v8 5.1, 5.4'
     'gpo'        = 'FFIEC IS II.C.2 Technology Design; Architecture, Infrastructure and Operations booklet | NIST CSF 2.0 PR.PS | CRI Profile PR.PS | CIS Controls v8 4.1, 4.2'
+    'structure'  = 'FFIEC IS II.C.5 Inventory and Classification of Assets; II.C.7 User Security Controls; II.C.9 Network Controls | NIST CSF 2.0 ID.AM, PR.AA | CRI Profile ID.AM, PR.AA | CIS Controls v8 1.1, 5.1, 12.2'
 }
 
 # ------------------------------------------------------- recommendations ----
@@ -517,6 +569,16 @@ $script:Recommendations = @{
     'svc-interactive'  = 'Restrict these accounts, or convert them to managed service accounts. To restrict: put the service accounts in a security group and add that group to "Deny log on locally" and "Deny log on through Remote Desktop Services" in a GPO linked where they could otherwise sign in - leaving "Log on as a service" and "Log on as a batch job" in place, because services and scheduled tasks need those and removing them stops the application. To convert: a group Managed Service Account (gMSA) has its password owned by Active Directory, which generates it at 240 random characters and ROTATES IT AUTOMATICALLY every 30 days by default, releasing it only to the hosts you authorise. Nobody ever knows the password, it cannot be typed at a logon prompt, and it never needs manual rotation - which also removes the password-never-expires exception. The domain needs a KDS root key and the application must support gMSA (SQL Server, IIS application pools and scheduled tasks do; many third-party applications do not). Where neither is possible, document the exception and rotate the password on a defined schedule.'
     'svc-nopolicy'     = 'Create a GPO that denies interactive logon to service and administrative accounts: add the relevant security groups to "Deny log on locally" and "Deny log on through Remote Desktop Services", linked to the workstation and server OUs. Without it the Windows defaults apply and any enabled account can sign in at a console wherever it has access.'
     'unlinked'         = 'Review each unlinked GPO. Delete those that are obsolete; for any kept deliberately, record why in the GPO description.'
+
+    # ---- domain structure: connected domains and what a comparison found
+    'structure-unscanned'       = 'Run this same report in each connected domain and bring it to the committee alongside this one. Group Policy, password policy and privileged groups are set separately in every domain, so a review of one says nothing about the others. Until each has been reviewed, treat the connected domain as an unreviewed route into this one.'
+    'structure-dup-accounts'    = 'Decide which domain is the home for each person and retire the account in the other. Where both are required, record why, make sure the two passwords cannot be the same, and hold both domains to the stricter password and lockout policy. Disable the duplicate first, then delete it after the retention period in the deprovisioning procedure.'
+    'structure-dup-computers'   = 'Confirm which domain each computer is really joined to - the more recent check-in - then disable and delete the leftover account in the other domain.'
+    'structure-split-computers' = 'Decide which domain workstations belong in, document it, and move the workstations that are in the other one. A workstation takes its Group Policy, password rules and lockout rules from the domain it is joined to, so until they are in one domain the same controls have to be built, and reviewed, twice.'
+    'structure-policy-mismatch' = 'Bring the weaker domain up to the stricter password and lockout policy, or document and approve the difference. Where a trust lets accounts from one domain reach the other, the trusted domain''s policy is the one protecting both.'
+    'structure-foreign-priv'    = 'Remove accounts that belong to another domain from this domain''s privileged groups unless there is a documented need. Where one must stay, name its owner, include it in this domain''s access review, and confirm the other domain''s password and lockout policy is at least as strict as this one''s.'
+    'structure-sidfilter'       = 'Turn SID filtering back on for the trust: "netdom trust <this domain> /domain:<other domain> /quarantine:yes" for an external trust, or "/enablesidhistory:no" for a forest trust. If a migration that depends on SID history is in progress, record its end date and turn filtering back on when it finishes.'
+    'structure-indicators'      = 'Establish who owns each domain named, whether the organization''s staff or computers use it, and whether it should exist. Scan any that is in use and decommission any that is not.'
 }
 
 # --------------------------------------------------- recommended settings ----
@@ -1145,13 +1207,13 @@ function Get-DirUsers {
         if ($Server) { $adp['Server'] = $Server }
         $props = @('Enabled', 'LastLogonDate', 'PasswordLastSet', 'PasswordNeverExpires',
                    'whenCreated', 'Description', 'logonHours', 'LogonWorkstations', 'AccountExpirationDate',
-                   'ServicePrincipalNames')
+                   'ServicePrincipalNames', 'UserPrincipalName')
         $out = @(Get-ADUser -Filter * -Properties $props @adp)
     }
     elseif ($script:AdMode -eq 'LDAP') {
         $props = @('samaccountname', 'name', 'displayname', 'distinguishedname', 'useraccountcontrol',
                    'lastlogontimestamp', 'pwdlastset', 'accountexpires', 'whencreated', 'description',
-                   'logonhours', 'userworkstations', 'serviceprincipalname')
+                   'logonhours', 'userworkstations', 'serviceprincipalname', 'userprincipalname')
         $filter = '(&(objectCategory=person)(objectClass=user))'
         foreach ($r in (Invoke-LdapSearch -Root $script:LdapRoot -Filter $filter -Props $props)) {
 
@@ -1176,6 +1238,7 @@ function Get-DirUsers {
                 logonHours            = (Get-LdapVal $r 'logonhours')
                 LogonWorkstations     = [string](Get-LdapVal $r 'userworkstations')
                 ServicePrincipalNames = @(Get-LdapVals $r 'serviceprincipalname')
+                UserPrincipalName     = [string](Get-LdapVal $r 'userprincipalname')
             }
         }
     }
@@ -1194,12 +1257,12 @@ function Get-DirComputers {
     if ($script:AdMode -eq 'Module') {
         $adp = @{}
         if ($Server) { $adp['Server'] = $Server }
-        $props = @('Enabled', 'LastLogonDate', 'PasswordLastSet', 'OperatingSystem', 'whenCreated', 'Description')
+        $props = @('Enabled', 'LastLogonDate', 'PasswordLastSet', 'OperatingSystem', 'whenCreated', 'Description', 'DNSHostName')
         $out = @(Get-ADComputer -Filter * -Properties $props @adp)
     }
     elseif ($script:AdMode -eq 'LDAP') {
         $props = @('name', 'distinguishedname', 'useraccountcontrol', 'lastlogontimestamp',
-                   'pwdlastset', 'operatingsystem', 'whencreated', 'description')
+                   'pwdlastset', 'operatingsystem', 'whencreated', 'description', 'dnshostname')
         foreach ($r in (Invoke-LdapSearch -Root $script:LdapRoot -Filter '(objectCategory=computer)' -Props $props)) {
 
             $uac = 0
@@ -1215,6 +1278,7 @@ function Get-DirComputers {
                 PasswordLastSet   = (ConvertFrom-AdFileTime (Get-LdapVal $r 'pwdlastset'))
                 whenCreated       = (Get-LdapVal $r 'whencreated')
                 Description       = [string](Get-LdapVal $r 'description')
+                DNSHostName       = [string](Get-LdapVal $r 'dnshostname')
             }
         }
     }
@@ -1423,6 +1487,7 @@ function Get-CleanupData {
             n = [string](Get-Prop $c 'OperatingSystem')
             e = [bool](Get-Prop $c 'Enabled')
             o = [string](($c.DistinguishedName -split ',', 2)[1])
+            l = $(if ($ll) { ([datetime]$ll).ToString('yyyy-MM-dd') } else { '' })
         }
 
         $stale = $false
@@ -2382,30 +2447,31 @@ else { $userInv.Error = $script:AdSkipReason }
 
 # ======================================== mass storage / removable media ====
 
-# Setting names that RESTRICT removable media, and names that PERMIT it. The
-# name decides which family a setting is in; its VALUE then decides which way
-# it actually lands (a "Deny all access" set to Disabled permits, it does not
-# restrict).
-$script:MsDenyNames = 'Deny all access|Deny write access|Deny read access|Deny execute access|' +
-    'Removable Disks: Deny|CD and DVD: Deny|Floppy Drives: Deny|Tape Drives: Deny|WPD Devices: Deny|' +
-    'Custom Classes: Deny|Prevent installation of devices|Restrict CD-ROM access|Restrict floppy access|' +
-    'Portable Operating System|USBSTOR'
+# Setting names, by what they actually do to removable storage. The name puts a
+# setting in a family; its VALUE then decides which way it lands (a "Deny all
+# access" set to Disabled permits, it does not restrict).
+#   Restrict - denies USB / removable-disk storage, or every removable class
+#   Partial  - denies only optical, floppy or tape media; USB storage is untouched
+#   Allow    - explicitly opens access, or lets someone override a restriction
+#   Note     - about removable media, but neither opens nor closes access
+#              (auditing, BitLocker recovery, who may eject a disk, CD-ROM sharing)
+$script:MsDenyNames = 'All Removable Storage classes: Deny|All Removable Storage: Deny|Removable Disks: Deny|' +
+    'WPD Devices: Deny|Custom Classes: Deny|Deny write access to removable drives not protected by BitLocker|' +
+    'Prevent installation of removable devices|Prevent installation of devices|USBSTOR'
+$script:MsPartialNames = 'CD and DVD: Deny|Floppy Drives: Deny|Tape Drives: Deny'
 $script:MsAllowNames = 'Allow administrators to override|Allow installation of devices|' +
-    'Allow direct access in remote sessions|Allow access to removable|Allow remote access to removable|' +
-    'Allowed to format and eject removable media'
+    'Allow direct access in remote sessions|Allow access to removable|Allow remote access to removable'
 
 function Get-MsSettingEffect {
-    <#
-      Restrict / Allow / Note for one removable-storage setting. "Note" means
-      the setting is in scope for this area but does not by itself open or
-      close access, so it is listed without being counted either way.
-    #>
+    <# Restrict / Partial / Allow / Note for one removable-storage setting. #>
     param([string]$Name, [string]$Value)
 
     $v = "$Value"
 
+    if ($Name -match '^Audit\b') { return 'Note' }
+
     if ($Name -match 'USBSTOR') {
-        if ($v -match '\b4\b|Disabled')       { return 'Restrict' }
+        if ($v -match '\b4\b|Disabled')         { return 'Restrict' }
         if ($v -match '\b3\b|Manual|Automatic') { return 'Allow' }
         return 'Note'
     }
@@ -2413,9 +2479,13 @@ function Get-MsSettingEffect {
         if ($v -match '^\s*Disabled')  { return 'Note' }
         return 'Allow'
     }
+    if ($Name -match $script:MsPartialNames) {
+        if ($v -match '^\s*Disabled|Not configured') { return 'Note' }
+        return 'Partial'
+    }
     if ($Name -match $script:MsDenyNames) {
-        if ($v -match '^\s*Disabled')  { return 'Allow' }
-        if ($v -match 'Not configured'){ return 'Note' }
+        if ($v -match '^\s*Disabled')   { return 'Allow' }
+        if ($v -match 'Not configured') { return 'Note' }
         return 'Restrict'
     }
     return 'Note'
@@ -2553,7 +2623,7 @@ function Add-PasswordSuggestion {
     A '<h5>Where to set it in Group Policy</h5>'
     A '<ol>'
     A '<li>Edit the GPO linked at the <b>domain root</b> &ndash; password policy applies to the domain from there, not from an OU.</li>'
-    A ("<li>Browse to <code>{0}</code>.</li>" -f (HtmlEnc ($script:GpoPathPwd -replace ' > ', ' &rarr; ')))
+    A ("<li>Browse to <code>{0}</code>.</li>" -f ((HtmlEnc $script:GpoPathPwd) -replace ' &gt; ', ' &rarr; '))
     A ("<li>Set <code>Minimum password length</code> to <b>{0}</b>.</li>" -f $script:PwdMinLength)
     A ("<li>Set <code>Maximum password age</code> to <b>{0}</b> for the examiner profile, or to <b>0</b> for the NIST profile.</li>" -f $script:PwdExaminerMaxAge)
     A '<li>For administrators, set the same values on their fine-grained password policy so the two do not drift apart.</li>'
@@ -2606,6 +2676,7 @@ function Get-MassStorageReview {
             }
         }
         $restrictSets = @($classified | Where-Object { $_.Effect -eq 'Restrict' })
+        $partialSets  = @($classified | Where-Object { $_.Effect -eq 'Partial' })
         $allowSets    = @($classified | Where-Object { $_.Effect -eq 'Allow' })
 
         $activeLinks = @($sc.Links | Where-Object { $_.Enabled -eq 'true' })
@@ -2619,7 +2690,10 @@ function Get-MassStorageReview {
         }
 
         # what this GPO does when it does apply
-        $verdict = if ($restrictSets.Count -gt 0) { 'Restricted' } else { 'Allowed' }
+        $verdict = 'None'
+        if     ($restrictSets.Count -gt 0) { $verdict = 'Restricted' }
+        elseif ($partialSets.Count  -gt 0) { $verdict = 'Partial' }
+        elseif ($allowSets.Count    -gt 0) { $verdict = 'Allowed' }
 
         $settingText = @($classified | ForEach-Object { '{0} = {1}' -f $_.Name, $_.Value })
 
@@ -2632,7 +2706,17 @@ function Get-MassStorageReview {
             Settings   = $classified
             Restricts  = $restrictSets.Count
             Allows     = $allowSets.Count
+            Scope      = $sc
+            Links      = (@($sc.Links | ForEach-Object { $_.SOMPath }) -join '; ')
         }
+
+        # A GPO that only audits removable storage, sets BitLocker recovery or
+        # says who may eject a disk neither denies nor permits access. It is
+        # listed as related, and is not a target row.
+        if ($verdict -eq 'None') { continue }
+
+        $openWhy = $(if ($verdict -eq 'Partial') { 'The GPO applies here but only restricts optical, floppy or tape media. USB mass storage is not denied by it' }
+                     else { 'The GPO applies here but only permits removable storage' })
 
         $setText = ($settingText -join ' | ')
         $bag = @()
@@ -2657,8 +2741,7 @@ function Get-MassStorageReview {
                         $(if ($l.Enforced -eq 'true') { ', and the link is enforced' } else { '' })) $first $inForce $setText)
             }
             else {
-                $bag += (New-MsRow $l.SOMPath 'Container' 'Allowed' `
-                    'The GPO applies here but only permits removable storage' $first $inForce $setText)
+                $bag += (New-MsRow $l.SOMPath 'Container' 'Allowed' $openWhy $first $inForce $setText)
             }
         }
 
@@ -2673,8 +2756,7 @@ function Get-MassStorageReview {
                     'In the security filtering, so the deny settings reach it' $first $inForce $setText)
             }
             else {
-                $bag += (New-MsRow $p.Name $p.Type 'Allowed' `
-                    'In the security filtering of a GPO that only permits removable storage' $first $inForce $setText)
+                $bag += (New-MsRow $p.Name $p.Type 'Allowed' $openWhy $first $inForce $setText)
             }
         }
 
@@ -2705,8 +2787,162 @@ function Get-MassStorageReview {
 
     [pscustomobject]@{
         Rows     = @($rows | Sort-Object Rank, Type, Target)
-        Gpos     = @($gpoCards | Sort-Object Gpo)
+        Gpos     = @($gpoCards | Where-Object { $_.Verdict -ne 'None' } | Sort-Object Gpo)
+        Related  = @($gpoCards | Where-Object { $_.Verdict -eq 'None' } | Sort-Object Gpo)
         AnyForce = (@($gpoCards | Where-Object { $_.InForce -and $_.Verdict -eq 'Restricted' }).Count -gt 0)
+    }
+}
+
+function ConvertTo-CanonicalPath {
+    <# OU=Tellers,OU=Staff,DC=corp,DC=local -> corp.local/Staff/Tellers - the form GPO links are reported in. #>
+    param([string]$Dn)
+    $dcs  = @()
+    $rest = @()
+    foreach ($part in @("$Dn" -split '(?<!\\),')) {
+        $pt = $part.Trim()
+        if (-not $pt) { continue }
+        if ($pt -like 'DC=*') { $dcs += $pt.Substring(3) }
+        else {
+            $i = $pt.IndexOf('=')
+            $rest += $(if ($i -ge 0) { $pt.Substring($i + 1) } else { $pt }) -replace '\\,', ','
+        }
+    }
+    [array]::Reverse($rest)
+    $path = ($dcs -join '.')
+    if ($rest.Count -gt 0) { $path = $path + '/' + ($rest -join '/') }
+    return $path
+}
+
+function Test-MsPrincipalMatch {
+    <#
+      Does this account fall under one of a GPO's security-filtering entries?
+      Returns the entry that matched, or ''. Groups are expanded to their
+      members at any nesting depth; the membership is cached per group.
+    #>
+    param($Principals, [string]$Sam, [string]$Kind, [bool]$IsDc)
+
+    $samLow = "$Sam".ToLower()
+    foreach ($p in @($Principals)) {
+        $leaf = Get-PrincipalLeaf $p.Name
+        if (-not $leaf) { continue }
+        if ($leaf -eq 'authenticated users' -or $leaf -eq 'everyone') { return [string]$p.Name }
+        if ($Kind -eq 'User'     -and $leaf -eq 'domain users')                         { return [string]$p.Name }
+        if ($Kind -eq 'Computer' -and $leaf -eq 'domain computers'   -and -not $IsDc)   { return [string]$p.Name }
+        if ($Kind -eq 'Computer' -and $leaf -eq 'domain controllers' -and $IsDc)        { return [string]$p.Name }
+        if ($leaf -eq $samLow) { return [string]$p.Name }
+        if ($p.Type -eq 'Group' -or $p.Type -eq 'Principal') {
+            $members = @(Get-GroupMemberSams -Server $Server -GroupName $leaf)
+            if ($members -contains $samLow) { return [string]$p.Name }
+        }
+    }
+    return ''
+}
+
+function Get-MassStorageAffected {
+    <#
+      Every user and every computer, and whether an applying GPO actually
+      denies it removable storage. A deny in Computer Configuration lands on
+      computers; a deny in User Configuration lands on users. An account is
+      Denied when a restricting GPO is linked above it AND its security
+      filtering includes it; it is an Exception when the GPO is linked above
+      it but the filtering leaves it out or explicitly denies it Apply.
+
+      Not modelled: Block Inheritance on an OU, WMI filter results, and site
+      links. The page says so.
+    #>
+    param($Review, $Users, $Computers, [string]$ThisDns)
+
+    $cards     = @($Review.Gpos | Where-Object { $_.InForce -and $_.Verdict -eq 'Restricted' })
+    $compCards = @()
+    $userCards = @()
+    $notes     = @()
+    foreach ($cd in $cards) {
+        $sides = @($cd.Settings | Where-Object { $_.Effect -eq 'Restrict' } | ForEach-Object { "$($_.Side)" } | Select-Object -Unique)
+        if ($sides -contains 'Computer') { $compCards += $cd }
+        if ($sides -contains 'User')     { $userCards += $cd }
+        if ($cd.Scope.WmiFilter) {
+            $notes += ('"{0}" carries the WMI filter "{1}". Computers that do not match the filter are not restricted, and that cannot be evaluated from here.' -f $cd.Gpo, $cd.Scope.WmiFilter)
+        }
+        foreach ($l in @($cd.Scope.Links)) {
+            if ($l.Enabled -eq 'true' -and $ThisDns -and -not ("$($l.SOMPath)".StartsWith($ThisDns, [System.StringComparison]::OrdinalIgnoreCase))) {
+                $notes += ('"{0}" is linked to the site "{1}". Site links are not resolved to individual accounts here.' -f $cd.Gpo, $l.SOMPath)
+            }
+        }
+    }
+
+    $rows = @()
+
+    $objects = @()
+    foreach ($c in @($Computers)) {
+        $objects += [pscustomobject]@{ Kind = 'Computer'; Name = $c.Name; Sam = ('{0}$' -f $c.Name); Path = (ConvertTo-CanonicalPath $c.OU)
+            OU = $c.OU; Enabled = [bool]$c.Enabled; IsDc = [bool]$c.IsDc; Detail = [string]$c.OS }
+    }
+    foreach ($u in @($Users)) {
+        if ("$($u.Sam)".EndsWith('$')) { continue }     # trust and machine-style accounts are not people
+        $objects += [pscustomobject]@{ Kind = 'User'; Name = $u.Name; Sam = $u.Sam; Path = (ConvertTo-CanonicalPath $u.OU)
+            OU = $u.OU; Enabled = [bool]$u.Enabled; IsDc = $false; Detail = [string]$u.Description }
+    }
+
+    foreach ($o in $objects) {
+        $deniedBy = @()
+        $excused  = @()
+        $relevant = $(if ($o.Kind -eq 'Computer') { $compCards } else { $userCards })
+
+        foreach ($cd in @($relevant)) {
+            $under = $false
+            foreach ($l in @($cd.Scope.Links)) {
+                if ($l.Enabled -ne 'true') { continue }
+                $som = "$($l.SOMPath)"
+                if (-not $som) { continue }
+                if ($o.Path -eq $som -or $o.Path.StartsWith($som + '/', [System.StringComparison]::OrdinalIgnoreCase)) { $under = $true }
+            }
+            if (-not $under) { continue }
+
+            $no  = Test-MsPrincipalMatch -Principals $cd.Scope.DenyApplyDetail -Sam $o.Sam -Kind $o.Kind -IsDc $o.IsDc
+            $yes = Test-MsPrincipalMatch -Principals $cd.Scope.ApplyToDetail   -Sam $o.Sam -Kind $o.Kind -IsDc $o.IsDc
+            if ($no)      { $excused  += ('"{0}" is linked above it, but {1} is denied Apply' -f $cd.Gpo, $no) }
+            elseif ($yes) { $deniedBy += [string]$cd.Gpo }
+            else          { $excused  += ('"{0}" is linked above it, but its security filtering does not include this account' -f $cd.Gpo) }
+        }
+
+        $effect = 'Allowed'
+        $why    = ''
+        if ($deniedBy.Count -gt 0) {
+            $effect = 'Denied'
+            $why    = ('Denied by {0}' -f ((@($deniedBy | Select-Object -Unique)) -join '; '))
+        }
+        elseif ($excused.Count -gt 0) {
+            $effect = 'Exception'
+            $why    = ((@($excused | Select-Object -Unique)) -join '. ')
+        }
+        elseif ($o.Kind -eq 'User' -and $compCards.Count -gt 0) {
+            $effect = 'Follows the computer'
+            $why    = 'No policy denies this account itself. Removable storage is denied to it on every computer in the Denied list and allowed on the rest'
+        }
+        elseif ($o.Kind -eq 'Computer') { $why = 'No applying GPO that denies removable storage reaches this computer' }
+        else                            { $why = 'No applying GPO denies removable storage to this account, or to any computer' }
+
+        $rows += [pscustomobject]@{
+            Name    = $o.Name
+            Sam     = $o.Sam
+            Kind    = $o.Kind
+            Effect  = $effect
+            Why     = $why
+            Enabled = $o.Enabled
+            OU      = $o.OU
+            Detail  = $o.Detail
+        }
+    }
+
+    $rank = @{ 'Exception' = 0; 'Allowed' = 1; 'Follows the computer' = 2; 'Denied' = 3 }
+    foreach ($r in $rows) { Add-Member -InputObject $r -NotePropertyName 'Rank' -NotePropertyValue $rank[$r.Effect] }
+
+    [pscustomobject]@{
+        Checked   = $true
+        Rows      = @($rows | Sort-Object Rank, Kind, Name)
+        Notes     = @($notes | Select-Object -Unique)
+        CompSide  = $compCards.Count
+        UserSide  = $userCards.Count
     }
 }
 
@@ -2718,8 +2954,1562 @@ $msReview = $null
 try { $msReview = Get-MassStorageReview -UsbHits @($focus['usb']) }
 catch { Write-Warn ("Mass storage review failed: {0}" -f $_.Exception.Message) }
 if ($null -eq $msReview) {
-    $msReview = [pscustomobject]@{ Rows = @(); Gpos = @(); AnyForce = $false }
+    $msReview = [pscustomobject]@{ Rows = @(); Gpos = @(); Related = @(); AnyForce = $false }
 }
+
+# ===================================================== DOMAIN STRUCTURE =====
+# Where this domain sits in its forest, which trusts it has, who from another
+# domain holds privilege here, and what evidence there is of other Active
+# Directory domains nearby. Everything in this block is read over plain LDAP
+# (System.DirectoryServices) in BOTH access modes: it needs nothing the
+# ActiveDirectory module adds, and it keeps working when ADWS does not.
+#
+# Group Policy stops at the domain boundary, so nothing here changes what the
+# rest of the report says about THIS domain. It exists to say which OTHER
+# domains are connected and should be reviewed too.
+
+$script:DsServer      = $(if ($Server) { $Server } else { $Domain })
+$script:TrustAccounts = @{}     # lower-case sAMAccountName -> the domain the trust account belongs to
+$script:BuiltinSams   = @('administrator', 'guest', 'krbtgt', 'defaultaccount', 'wdagutilityaccount')
+
+function Get-DsPath {
+    param([string]$Dn, [string]$OnServer = $script:DsServer)
+    if ($OnServer) { return ('LDAP://{0}/{1}' -f $OnServer, $Dn) }
+    return ('LDAP://{0}' -f $Dn)
+}
+
+function ConvertTo-DnsName {
+    <# DC=corp,DC=example,DC=local -> corp.example.local #>
+    param([string]$Dn)
+    $parts = @("$Dn" -split ',' | Where-Object { $_ -like 'DC=*' } | ForEach-Object { $_.Substring(3) })
+    return ($parts -join '.')
+}
+
+function ConvertTo-SidString {
+    param($Bytes)
+    if ($null -eq $Bytes) { return '' }
+    try { return (New-Object System.Security.Principal.SecurityIdentifier(([byte[]]$Bytes), 0)).Value }
+    catch { return '' }
+}
+
+function Get-SidDomainPart {
+    <# S-1-5-21-a-b-c-1105 -> S-1-5-21-a-b-c #>
+    param([string]$Sid)
+    $i = "$Sid".LastIndexOf('-')
+    if ($i -le 0) { return "$Sid" }
+    return "$Sid".Substring(0, $i)
+}
+
+function Get-RootDse {
+    <#
+      The directory's public header. Readable without signing in, which is what
+      lets the subnet probe name a domain controller it has no account on.
+    #>
+    param([string]$OnServer, [switch]$Anonymous)
+
+    $out = @{ defaultNamingContext = ''; rootDomainNamingContext = ''; configurationNamingContext = ''; dnsHostName = '' }
+    $de  = $null
+    try {
+        $path = Get-DsPath -Dn 'RootDSE' -OnServer $OnServer
+        if ($Anonymous) {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($path, $null, $null, [System.DirectoryServices.AuthenticationTypes]::Anonymous)
+        }
+        else {
+            $de = New-Object System.DirectoryServices.DirectoryEntry($path)
+        }
+        $de.RefreshCache()
+        foreach ($n in @('defaultNamingContext', 'rootDomainNamingContext', 'configurationNamingContext', 'dnsHostName')) {
+            try { if ($de.Properties[$n].Count -gt 0) { $out[$n] = [string]$de.Properties[$n][0] } } catch { }
+        }
+    }
+    catch { }
+    finally { if ($null -ne $de) { try { $de.Dispose() } catch { } } }
+    return $out
+}
+
+function Invoke-LdapBaseRead {
+    <# One object, by path. Used where a subtree search could wander into another partition. #>
+    param([string]$Path, [string[]]$Props)
+    $entry = New-Object System.DirectoryServices.DirectoryEntry($Path)
+    $ds = New-Object System.DirectoryServices.DirectorySearcher($entry)
+    $ds.Filter      = '(objectClass=*)'
+    $ds.SearchScope = 'Base'
+    foreach ($p in $Props) { [void]$ds.PropertiesToLoad.Add($p) }
+    try   { return $ds.FindOne() }
+    finally { $ds.Dispose(); $entry.Dispose() }
+}
+
+function Get-LdapRawVals {
+    <# Every value of an attribute, untouched - for binary attributes such as sIDHistory. #>
+    param($Result, [string]$Name)
+    $out = @()
+    try {
+        if ($null -ne $Result -and $Result.Properties.Contains($Name)) {
+            foreach ($v in $Result.Properties[$Name]) { $out += , $v }
+        }
+    }
+    catch { }
+    return , $out
+}
+
+function Test-TcpPort {
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 3000)
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        try { $c.EndConnect($ar) } catch { return $false }
+        return [bool]$c.Connected
+    }
+    catch { return $false }
+    finally { try { $c.Close() } catch { } }
+}
+
+function Test-AdDomainDns {
+    <#
+      Is there a live Active Directory domain by this DNS name? Every AD domain
+      publishes its domain controllers under _ldap._tcp.dc._msdcs.<domain>, so
+      one lookup answers it without touching the domain itself.
+    #>
+    param([string]$Name)
+    $res = [pscustomobject]@{ Live = 'Not checked'; Dcs = '' }
+    if (-not $Name -or $Name -notmatch '\.') { return $res }
+    if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) { return $res }
+    try {
+        $recs = @(Resolve-DnsName -Name ('_ldap._tcp.dc._msdcs.{0}' -f $Name) -Type SRV -DnsOnly -ErrorAction Stop)
+        $dcs  = @($recs | ForEach-Object { Get-Prop $_ 'NameTarget' } | Where-Object { $_ } | Select-Object -Unique)
+        if ($dcs.Count -gt 0) { $res.Live = 'Yes'; $res.Dcs = ((@($dcs | Select-Object -First 4)) -join ', ') }
+        else { $res.Live = 'No' }
+    }
+    catch { $res.Live = 'No' }
+    return $res
+}
+
+function New-DomainStructure {
+    [pscustomobject]@{
+        Checked       = $false
+        Error         = ''
+        ThisDns       = "$Domain"
+        DomainDn      = ''
+        DomainSid     = ''
+        NetBios       = ''
+        ForestRoot    = ''
+        ForestDomains = @()
+        Position      = 'Unknown'
+        PositionText  = ''
+        Parent        = ''
+        Children      = @()
+        Trusts        = @()
+        TrustsChecked = $false
+        TrustsError   = ''
+        DcName        = ''
+    }
+}
+
+function ConvertTo-TrustRow {
+    <# One trustedDomain object, in the words a committee can read. #>
+    param($Result)
+
+    $partner = [string](Get-LdapVal $Result 'trustpartner')
+    $flat    = [string](Get-LdapVal $Result 'flatname')
+    $dir = 0; [void][int]::TryParse("$(Get-LdapVal $Result 'trustdirection')",  [ref]$dir)
+    $typ = 0; [void][int]::TryParse("$(Get-LdapVal $Result 'trusttype')",       [ref]$typ)
+    $att = 0; [void][int]::TryParse("$(Get-LdapVal $Result 'trustattributes')", [ref]$att)
+    $sid = ConvertTo-SidString (Get-LdapVal $Result 'securityidentifier')
+
+    $nonTrans = (($att -band 0x1)  -ne 0)   # NON_TRANSITIVE
+    $quar     = (($att -band 0x4)  -ne 0)   # QUARANTINED_DOMAIN  - SID filtering on an external trust
+    $forestT  = (($att -band 0x8)  -ne 0)   # FOREST_TRANSITIVE   - a forest trust
+    $selAuth  = (($att -band 0x10) -ne 0)   # CROSS_ORGANIZATION  - selective authentication
+    $within   = (($att -band 0x20) -ne 0)   # WITHIN_FOREST
+    $asExt    = (($att -band 0x40) -ne 0)   # TREAT_AS_EXTERNAL   - SID history allowed over a forest trust
+
+    $trustsOut = (($dir -band 2) -ne 0)     # this domain trusts the partner: THEIR accounts can come in
+    $trustsIn  = (($dir -band 1) -ne 0)     # the partner trusts this domain: OUR accounts can go out
+
+    $dirName = 'Disabled'
+    $meaning = 'The trust object exists but neither direction is active.'
+    if ($trustsOut -and $trustsIn) {
+        $dirName = 'Two-way'
+        $meaning = ('Each domain trusts the other. Accounts from {0} can be given access here, and accounts from this domain can be given access in {0}.' -f $partner)
+    }
+    elseif ($trustsOut) {
+        $dirName = 'One-way: this domain trusts the other'
+        $meaning = ('This domain trusts {0}. Accounts from {0} can be given access to resources HERE. Accounts from this domain cannot sign in to {0} through this trust.' -f $partner)
+    }
+    elseif ($trustsIn) {
+        $dirName = 'One-way: the other domain trusts this one'
+        $meaning = ('{0} trusts this domain. Accounts from THIS domain can be given access to resources in {0}. Nothing from {0} can sign in here through this trust.' -f $partner)
+    }
+
+    $kind = 'External trust'
+    if ($within)        { $kind = 'Same forest' }
+    elseif ($forestT)   { $kind = 'Forest trust' }
+    elseif ($typ -eq 3) { $kind = 'Kerberos realm (non-Windows)' }
+    elseif ($typ -eq 1) { $kind = 'External trust (Windows NT style)' }
+
+    $transitive = 'No'
+    if ($within)                         { $transitive = 'Yes' }
+    elseif ($forestT -and -not $nonTrans) { $transitive = 'Yes - reaches every domain in both forests' }
+
+    # SID filtering protects the TRUSTING side, so it is only this domain's
+    # control when this domain is the one doing the trusting.
+    $sidFilter = 'On'
+    $sidRisk   = $false
+    if ($within) { $sidFilter = 'Not applicable (same forest)' }
+    elseif (-not $trustsOut) { $sidFilter = ('Applied by {0}, not here' -f $partner) }
+    elseif ($forestT) {
+        if ($asExt) { $sidFilter = 'Relaxed - SID history is accepted across this trust'; $sidRisk = $true }
+    }
+    elseif (-not $quar) { $sidFilter = 'Off'; $sidRisk = $true }
+
+    $auth = 'Domain-wide'
+    if ($within)        { $auth = 'Forest-wide' }
+    elseif ($selAuth)   { $auth = 'Selective' }
+    elseif ($forestT)   { $auth = 'Forest-wide' }
+
+    $created = ''
+    $changed = ''
+    try { $wc = Get-LdapVal $Result 'whencreated'; if ($wc) { $created = ([datetime]$wc).ToString('yyyy-MM-dd') } } catch { }
+    try { $wm = Get-LdapVal $Result 'whenchanged'; if ($wm) { $changed = ([datetime]$wm).ToString('yyyy-MM-dd') } } catch { }
+
+    [pscustomobject]@{
+        Partner      = $partner
+        Flat         = $flat
+        Sid          = $sid
+        Direction    = $dirName
+        DirCode      = $dir
+        TrustsOut    = $trustsOut
+        TrustsIn     = $trustsIn
+        Meaning      = $meaning
+        Kind         = $kind
+        WithinForest = $within
+        Transitive   = $transitive
+        SidFilter    = $sidFilter
+        SidRisk      = $sidRisk
+        Auth         = $auth
+        Selective    = $selAuth
+        Created      = $created
+        Changed      = $changed
+        Attributes   = $att
+        TrustAccount = $(if ($trustsIn -and $flat) { ('{0}$' -f $flat) } else { '' })
+    }
+}
+
+function Get-DomainStructure {
+    <#
+      Forest position and trusts. The forest's domains come from the Partitions
+      container, which every domain controller in the forest carries, so this
+      works from any domain - root, child or in between.
+    #>
+    $res = New-DomainStructure
+
+    $dse = Get-RootDse -OnServer $script:DsServer
+    $dn  = [string]$dse['defaultNamingContext']
+    if (-not $dn) {
+        $res.Error = 'The directory did not answer an LDAP query for its naming contexts, so the forest and trust layout could not be read.'
+        return $res
+    }
+    $rootDn = [string]$dse['rootDomainNamingContext']
+    if (-not $rootDn) { $rootDn = $dn }
+    $cfgDn  = [string]$dse['configurationNamingContext']
+
+    $res.DomainDn   = $dn
+    $res.ThisDns    = ConvertTo-DnsName $dn
+    $res.ForestRoot = ConvertTo-DnsName $rootDn
+    $res.DcName     = [string]$dse['dnsHostName']
+
+    try {
+        $head = Invoke-LdapBaseRead -Path (Get-DsPath $dn) -Props @('objectsid')
+        $res.DomainSid = ConvertTo-SidString (Get-LdapVal $head 'objectsid')
+    }
+    catch { }
+
+    # ---- every domain in the forest
+    $doms = @()
+    try {
+        if ($cfgDn) {
+            $refs = @(Invoke-LdapSearch -Root (Get-DsPath ('CN=Partitions,{0}' -f $cfgDn)) `
+                        -Filter '(&(objectClass=crossRef)(systemFlags:1.2.840.113556.1.4.803:=2))' `
+                        -Props @('distinguishedname', 'ncname', 'dnsroot', 'netbiosname', 'trustparent'))
+            foreach ($r in $refs) {
+                $doms += [pscustomobject]@{
+                    RefDn     = [string](Get-LdapVal $r 'distinguishedname')
+                    Nc        = [string](Get-LdapVal $r 'ncname')
+                    Dns       = [string](Get-LdapVal $r 'dnsroot')
+                    NetBios   = [string](Get-LdapVal $r 'netbiosname')
+                    ParentRef = [string](Get-LdapVal $r 'trustparent')
+                    Relation  = ''
+                    IsThis    = $false
+                }
+            }
+        }
+    }
+    catch { $res.Error = ('The list of domains in the forest could not be read: {0}' -f $_.Exception.Message) }
+
+    $me = $null
+    foreach ($d in $doms) { if ($d.Nc -eq $dn) { $me = $d } }
+
+    if ($null -ne $me) {
+        $me.IsThis   = $true
+        $me.Relation = 'This domain'
+        $res.NetBios = $me.NetBios
+
+        $parent   = $null
+        $children = @()
+        foreach ($d in $doms) {
+            if ($me.ParentRef -and $d.RefDn -eq $me.ParentRef) { $parent = $d }
+            if ($d.ParentRef -and $d.ParentRef -eq $me.RefDn)  { $children += $d }
+        }
+        if ($null -ne $parent) { $parent.Relation = 'Parent of this domain'; $res.Parent = $parent.Dns }
+        foreach ($c in $children) { $c.Relation = 'Child of this domain' }
+        $res.Children = @($children | ForEach-Object { $_.Dns })
+
+        foreach ($d in $doms) {
+            if ($d.Relation) { continue }
+            if ($d.Nc -eq $rootDn) { $d.Relation = 'Forest root' }
+            else                   { $d.Relation = 'Another domain in this forest' }
+        }
+
+        $isRoot = ($dn -eq $rootDn)
+        if ($doms.Count -le 1) {
+            $res.Position     = 'Single-domain forest'
+            $res.PositionText = 'the only domain in its forest. There is no parent domain above it and no child domain below it'
+        }
+        elseif ($isRoot -and $children.Count -gt 0) {
+            $res.Position     = 'Forest root'
+            $res.PositionText = ('the forest root, at the TOP of the structure, with {0} child domain(s) beneath it: {1}' -f $children.Count, ($res.Children -join ', '))
+        }
+        elseif ($isRoot) {
+            $res.Position     = 'Forest root'
+            $res.PositionText = 'the forest root. The other domain(s) in the forest are separate trees rather than children of this one'
+        }
+        elseif ($null -ne $parent -and $children.Count -gt 0) {
+            $res.Position     = 'Middle of the structure'
+            $res.PositionText = ('in the MIDDLE of the structure: a child of {0} and the parent of {1}' -f $parent.Dns, ($res.Children -join ', '))
+        }
+        elseif ($null -ne $parent) {
+            $res.Position     = 'Child domain'
+            $res.PositionText = ('at the BOTTOM of the structure: a child of {0}, with no domains beneath it' -f $parent.Dns)
+        }
+        else {
+            $res.Position     = 'Tree root'
+            $res.PositionText = ('the root of its own tree inside the forest {0}' -f $res.ForestRoot)
+        }
+    }
+    else {
+        $res.Position     = 'Unknown'
+        $res.PositionText = 'not listed in the forest partition table that was returned, so its position could not be placed'
+    }
+    $res.ForestDomains = @(@($doms | Where-Object { $_.IsThis }) + @($doms | Where-Object { -not $_.IsThis } | Sort-Object Dns))
+
+    # ---- trusts
+    try {
+        $tds = @(Invoke-LdapSearch -Root (Get-DsPath ('CN=System,{0}' -f $dn)) -Filter '(objectClass=trustedDomain)' `
+                    -Props @('trustpartner', 'flatname', 'trustdirection', 'trusttype', 'trustattributes', 'whencreated', 'whenchanged', 'securityidentifier'))
+        $rows = @()
+        foreach ($t in $tds) { $rows += (ConvertTo-TrustRow $t) }
+        $res.Trusts        = @($rows | Sort-Object Partner)
+        $res.TrustsChecked = $true
+    }
+    catch { $res.TrustsError = $_.Exception.Message }
+
+    $res.Checked = $true
+    return $res
+}
+
+function Get-ForeignPrivilegedMembers {
+    <#
+      Accounts from ANOTHER domain sitting directly in this domain's privileged
+      groups. Read from the member attribute rather than through the group
+      cmdlets, which can fail outright when a member lives across a trust.
+    #>
+    param($Structure)
+
+    $out = @()
+    if (-not $Structure.DomainSid) { return @() }
+
+    $targets = @(
+        @{ Label = 'Administrators (built-in)'; Sid = 'S-1-5-32-544' },
+        @{ Label = 'Domain Admins';             Sid = ('{0}-512' -f $Structure.DomainSid) }
+    )
+    if ($Structure.ForestRoot -and ($Structure.ForestRoot -eq $Structure.ThisDns)) {
+        $targets += @{ Label = 'Enterprise Admins'; Sid = ('{0}-519' -f $Structure.DomainSid) }
+        $targets += @{ Label = 'Schema Admins';     Sid = ('{0}-518' -f $Structure.DomainSid) }
+    }
+
+    foreach ($t in $targets) {
+        try {
+            $g = Invoke-LdapBaseRead -Path (Get-DsPath ('<SID={0}>' -f $t['Sid'])) -Props @('member')
+            if ($null -eq $g) { continue }
+            foreach ($m in @(Get-LdapVals $g 'member')) {
+                $mdn = [string]$m
+                if ($mdn -match '^CN=(S-1-[0-9\-]+),CN=ForeignSecurityPrincipals,') {
+                    $fsid = $Matches[1]
+                    if ($fsid -notmatch '^S-1-5-21-') { continue }   # well-known principals, not another domain's accounts
+                    $nm = ''
+                    try { $nm = (New-Object System.Security.Principal.SecurityIdentifier($fsid)).Translate([System.Security.Principal.NTAccount]).Value }
+                    catch { $nm = '' }
+                    $out += [pscustomobject]@{
+                        Group    = $t['Label']
+                        Member   = $(if ($nm) { $nm } else { $fsid })
+                        Sid      = $fsid
+                        Origin   = $(if ($nm) { 'Another forest or an external domain, reached through a trust' }
+                                     else { 'A domain that can no longer be resolved - the account behind this entry cannot be identified' })
+                        Resolved = [bool]$nm
+                    }
+                }
+                elseif ($Structure.DomainDn -and ($mdn -notlike ('*,{0}' -f $Structure.DomainDn))) {
+                    $leaf = (($mdn -split ',', 2)[0] -replace '^CN=', '')
+                    $out += [pscustomobject]@{
+                        Group    = $t['Label']
+                        Member   = ('{0} ({1})' -f $leaf, (ConvertTo-DnsName $mdn))
+                        Sid      = ''
+                        Origin   = 'Another domain in this forest'
+                        Resolved = $true
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+    return @($out)
+}
+
+# ------------------------------------------------ other-domain indicators ---
+
+function Add-DomainCandidate {
+    param([hashtable]$Bag, [string]$Name, [string]$Evidence, [string]$Source)
+    $shown = "$Name".Trim().TrimEnd('.')
+    $key   = $shown.ToLower()
+    if (-not $key) { return }
+    if (-not $Bag.ContainsKey($key)) {
+        $Bag[$key] = [pscustomobject]@{ Name = $shown; Evidence = @(); Sources = @(); Live = 'Not checked'; Dcs = '' }
+    }
+    if ($Bag[$key].Evidence -notcontains $Evidence) { $Bag[$key].Evidence += $Evidence }
+    if ($Bag[$key].Sources  -notcontains $Source)   { $Bag[$key].Sources  += $Source }
+}
+
+function Find-SubnetDomainControllers {
+    <#
+      OPT-IN (-ProbeSubnets). Tests TCP 389 on every address in this machine's
+      local /24 subnet(s) and, for each responder, reads the public directory
+      header to learn which domain it serves. Read-only. Capped at the /24
+      around each local address so a large flat network is never swept whole.
+    #>
+    $found = @()
+    $nets  = @()
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ("$($ni.OperationalStatus)" -ne 'Up') { continue }
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+                $ip = $ua.Address
+                if ("$($ip.AddressFamily)" -ne 'InterNetwork') { continue }
+                if ([System.Net.IPAddress]::IsLoopback($ip))   { continue }
+                $o = $ip.GetAddressBytes()
+                if ($o[0] -eq 169 -and $o[1] -eq 254) { continue }
+                $prefix = ('{0}.{1}.{2}' -f $o[0], $o[1], $o[2])
+                if ($nets -notcontains $prefix) { $nets += $prefix }
+            }
+        }
+    }
+    catch { }
+
+    foreach ($prefix in @($nets | Select-Object -First 4)) {
+        $pending = @()
+        foreach ($h in 1..254) {
+            $addr = ('{0}.{1}' -f $prefix, $h)
+            try {
+                $c  = New-Object System.Net.Sockets.TcpClient
+                $ar = $c.BeginConnect($addr, 389, $null, $null)
+                $pending += [pscustomobject]@{ Addr = $addr; Client = $c; Async = $ar }
+            }
+            catch { }
+        }
+        Start-Sleep -Milliseconds 700
+        $open = @()
+        foreach ($p in $pending) {
+            try { if ($p.Async.IsCompleted -and $p.Client.Connected) { $open += $p.Addr } } catch { }
+            try { $p.Client.Close() } catch { }
+        }
+        foreach ($addr in $open) {
+            $dse = Get-RootDse -OnServer $addr -Anonymous
+            $nc  = [string]$dse['defaultNamingContext']
+            if (-not $nc) { continue }      # an LDAP server, but not an Active Directory domain controller
+            $found += [pscustomobject]@{
+                Address = $addr
+                Domain  = (ConvertTo-DnsName $nc)
+                Forest  = (ConvertTo-DnsName ([string]$dse['rootDomainNamingContext']))
+                Host    = [string]$dse['dnsHostName']
+            }
+        }
+    }
+    [pscustomobject]@{ Subnets = @($nets | Select-Object -First 4 | ForEach-Object { '{0}.0/24' -f $_ }); Found = @($found) }
+}
+
+function Get-OtherDomainIndicators {
+    <#
+      A domain with no trust and no forest relationship is invisible to Active
+      Directory - there is no list to read. This looks for EVIDENCE of one in
+      places this domain already holds, then confirms each name with a single
+      DNS lookup. It can report "no indicators found in the places checked";
+      it can never report "no other domain exists".
+    #>
+    param($Structure, $Users, $Computers, $Settings, [switch]$Probe)
+
+    $res = [pscustomobject]@{
+        Checked    = $false
+        Rows       = @()
+        SidHistory = @()
+        Notes      = @()
+        ProbeRan   = $false
+        ProbeText  = ''
+    }
+
+    $thisDns = "$($Structure.ThisDns)".ToLower()
+    $known   = @{}
+    if ($thisDns) { $known[$thisDns] = $true }
+    foreach ($d in @($Structure.ForestDomains)) { if ($d.Dns)     { $known["$($d.Dns)".ToLower()] = $true } }
+    foreach ($t in @($Structure.Trusts))        { if ($t.Partner) { $known["$($t.Partner)".ToLower()] = $true } }
+
+    $sidNames = @{}
+    if ($Structure.DomainSid) { $sidNames[$Structure.DomainSid] = $Structure.ThisDns }
+    foreach ($t in @($Structure.Trusts)) { if ($t.Sid) { $sidNames[$t.Sid] = $t.Partner } }
+
+    $bag = @{}
+
+    # ---- 1. computers registered under a different DNS name
+    $bySuffix = @{}
+    foreach ($c in @($Computers)) {
+        $dnsName = "$(Get-Prop $c 'DNSHostName')".ToLower()
+        $i = $dnsName.IndexOf('.')
+        if ($i -le 0) { continue }
+        $suffix = $dnsName.Substring($i + 1)
+        if (-not $suffix -or $known.ContainsKey($suffix)) { continue }
+        if (-not $bySuffix.ContainsKey($suffix)) { $bySuffix[$suffix] = @() }
+        $bySuffix[$suffix] += "$($c.Name)"
+    }
+    foreach ($k in $bySuffix.Keys) {
+        Add-DomainCandidate $bag $k ('{0} computer account(s) in this domain are registered in DNS under this name, e.g. {1}' -f `
+            @($bySuffix[$k]).Count, ((@($bySuffix[$k] | Select-Object -First 3)) -join ', ')) 'computer'
+    }
+
+    # ---- 2. logon-name (UPN) suffixes that are not this domain
+    $byUpn = @{}
+    foreach ($u in @($Users)) {
+        $upn = "$(Get-Prop $u 'UserPrincipalName')".ToLower()
+        $i = $upn.LastIndexOf('@')
+        if ($i -lt 0) { continue }
+        $suffix = $upn.Substring($i + 1)
+        if (-not $suffix -or $known.ContainsKey($suffix)) { continue }
+        if (-not $byUpn.ContainsKey($suffix)) { $byUpn[$suffix] = 0 }
+        $byUpn[$suffix] = $byUpn[$suffix] + 1
+    }
+    foreach ($k in $byUpn.Keys) {
+        Add-DomainCandidate $bag $k ('{0} account(s) sign in with this name after the @' -f $byUpn[$k]) 'upn'
+    }
+
+    # ---- 3. network paths inside Group Policy that point somewhere else
+    $uncSeen = @{}
+    foreach ($s in @($Settings)) {
+        $text = ('{0} {1}' -f (Get-Prop $s 'Setting'), (Get-Prop $s 'Value'))
+        foreach ($m in [regex]::Matches($text, '\\\\([A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)+)\\')) {
+            $fq = $m.Groups[1].Value.ToLower()
+            if ($fq -match '^\d+\.\d+\.\d+\.\d+$') { continue }
+            if ($fq -eq $thisDns -or $fq.EndsWith('.' + $thisDns)) { continue }
+            if ($uncSeen.Count -ge 60 -and -not $uncSeen.ContainsKey($fq)) { continue }
+            if (-not $uncSeen.ContainsKey($fq)) { $uncSeen[$fq] = "$(Get-Prop $s 'GPO')" }
+        }
+    }
+
+    # ---- 4. DNS conditional forwarders and stub zones on the domain controller
+    if (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue) {
+        $dnsTarget = $(if ($Structure.DcName) { $Structure.DcName } else { $env:COMPUTERNAME })
+        try {
+            foreach ($z in @(Get-DnsServerZone -ComputerName $dnsTarget -ErrorAction Stop)) {
+                $zt = "$(Get-Prop $z 'ZoneType')"
+                $zn = "$(Get-Prop $z 'ZoneName')".ToLower()
+                if ($zt -notmatch 'Forwarder|Stub') { continue }
+                if (-not $zn -or $zn -eq '.' -or $zn -like '*.arpa' -or $zn -like '_msdcs.*') { continue }
+                if ($known.ContainsKey($zn)) { continue }
+                Add-DomainCandidate $bag $zn ('DNS on {0} has a {1} zone for this name, so someone arranged for this domain to find it' -f `
+                    $dnsTarget, $(if ($zt -match 'Stub') { 'stub' } else { 'conditional forwarder' })) 'dns'
+            }
+        }
+        catch { $res.Notes += ('DNS conditional forwarders on {0} could not be read: {1}' -f $dnsTarget, $_.Exception.Message) }
+    }
+    else {
+        $res.Notes += 'DNS conditional forwarders were not read: the DnsServer PowerShell module is not installed on the machine that ran this report. Run it on a domain controller to include them.'
+    }
+
+    # ---- 5. SID history - accounts migrated in from another domain
+    try {
+        $bySid = @{}
+        foreach ($r in @(Invoke-LdapSearch -Root (Get-DsPath $Structure.DomainDn) -Filter '(sIDHistory=*)' -Props @('samaccountname', 'sidhistory'))) {
+            $sam = [string](Get-LdapVal $r 'samaccountname')
+            foreach ($raw in (Get-LdapRawVals $r 'sidhistory')) {
+                $dp = Get-SidDomainPart (ConvertTo-SidString $raw)
+                if (-not $dp) { continue }
+                if (-not $bySid.ContainsKey($dp)) { $bySid[$dp] = @() }
+                if ($bySid[$dp] -notcontains $sam) { $bySid[$dp] += $sam }
+            }
+        }
+        foreach ($k in $bySid.Keys) {
+            $nm = $(if ($sidNames.ContainsKey($k)) { $sidNames[$k] } else { '' })
+            $res.SidHistory += [pscustomobject]@{
+                DomainSid = $k
+                Domain    = $(if ($nm) { $nm } else { 'A domain that is not a current trust partner' })
+                Known     = [bool]$nm
+                Count     = @($bySid[$k]).Count
+                Examples  = ((@($bySid[$k] | Select-Object -First 5)) -join ', ')
+            }
+            if (-not $nm) {
+                Add-DomainCandidate $bag ('Unknown domain (SID {0})' -f $k) ('{0} account(s) carry SID history from this domain, which means they were migrated from it, e.g. {1}' -f `
+                    @($bySid[$k]).Count, ((@($bySid[$k] | Select-Object -First 3)) -join ', ')) 'sidhistory'
+            }
+        }
+    }
+    catch { $res.Notes += ('SID history could not be read: {0}' -f $_.Exception.Message) }
+
+    # ---- 6. foreign security principals left behind by a domain that is no longer a trust partner
+    try {
+        $byFsp = @{}
+        foreach ($r in @(Invoke-LdapSearch -Root (Get-DsPath ('CN=ForeignSecurityPrincipals,{0}' -f $Structure.DomainDn)) `
+                            -Filter '(objectClass=foreignSecurityPrincipal)' -Props @('name'))) {
+            $fsid = [string](Get-LdapVal $r 'name')
+            if ($fsid -notmatch '^S-1-5-21-') { continue }
+            $dp = Get-SidDomainPart $fsid
+            if ($sidNames.ContainsKey($dp)) { continue }
+            if (-not $byFsp.ContainsKey($dp)) { $byFsp[$dp] = 0 }
+            $byFsp[$dp] = $byFsp[$dp] + 1
+        }
+        foreach ($k in $byFsp.Keys) {
+            Add-DomainCandidate $bag ('Unknown domain (SID {0})' -f $k) ('{0} group member reference(s) point at accounts in this domain, which is not a current trust partner' -f $byFsp[$k]) 'fsp'
+        }
+    }
+    catch { $res.Notes += ('Foreign security principals could not be read: {0}' -f $_.Exception.Message) }
+
+    # ---- 7. opt-in: domain controllers answering on the local subnet
+    if ($Probe) {
+        try {
+            $pr = Find-SubnetDomainControllers
+            $res.ProbeRan = $true
+            $others = @($pr.Found | Where-Object { $_.Domain -and -not $known.ContainsKey("$($_.Domain)".ToLower()) })
+            $res.ProbeText = ('Probed {0}. {1} domain controller(s) answered; {2} belong to a domain other than this one and its known partners.' -f `
+                $(if (@($pr.Subnets).Count -gt 0) { (@($pr.Subnets) -join ', ') } else { 'no usable local subnet' }), @($pr.Found).Count, $others.Count)
+            foreach ($f in $others) {
+                Add-DomainCandidate $bag $f.Domain ('Domain controller {0} ({1}) answered on the local subnet' -f $(if ($f.Host) { $f.Host } else { 'name not given' }), $f.Address) 'probe'
+            }
+        }
+        catch { $res.Notes += ('The subnet probe failed: {0}' -f $_.Exception.Message) }
+    }
+    else {
+        $res.ProbeText = 'The local subnet was not probed for other domain controllers. That check is opt-in (-ProbeSubnets) because it is a port sweep.'
+    }
+
+    # ---- confirm each DNS-style name with one lookup
+    $lookups = 0
+    foreach ($k in @($bag.Keys)) {
+        $cand = $bag[$k]
+        if ($cand.Name -like 'unknown domain*') { $cand.Live = 'Cannot be looked up - only the SID is known'; continue }
+        if ($cand.Sources -contains 'probe')   { $cand.Live = 'Yes'; continue }
+        if ($lookups -ge 40) { continue }
+        $lookups++
+        $chk = Test-AdDomainDns $cand.Name
+        $cand.Live = $chk.Live
+        $cand.Dcs  = $chk.Dcs
+    }
+
+    # network paths: \\other.local\share names a domain, \\server.other.local\share names a host in one.
+    foreach ($fq in @($uncSeen.Keys)) {
+        if ($lookups -ge 40) { break }
+        $names = @($fq)
+        $i = $fq.IndexOf('.')
+        if ($i -gt 0 -and $fq.Substring($i + 1) -match '\.') { $names += $fq.Substring($i + 1) }
+        foreach ($nm in $names) {
+            if ($known.ContainsKey($nm)) { break }
+            $lookups++
+            $chk = Test-AdDomainDns $nm
+            if ($chk.Live -eq 'Yes') {
+                Add-DomainCandidate $bag $nm ('A network path to {0} is written into the GPO "{1}"' -f $fq, $uncSeen[$fq]) 'gpo'
+                $bag[$nm].Live = 'Yes'
+                $bag[$nm].Dcs  = $chk.Dcs
+                break
+            }
+        }
+    }
+
+    # A logon suffix that is not a live AD domain is normally just the public
+    # e-mail domain. It is not evidence of another directory, so it is dropped.
+    $rows = @()
+    foreach ($k in @($bag.Keys)) {
+        $cand = $bag[$k]
+        $onlyWeak = (@($cand.Sources | Where-Object { $_ -ne 'upn' -and $_ -ne 'gpo' }).Count -eq 0)
+        if ($onlyWeak -and $cand.Live -eq 'No') { continue }
+        $rows += $cand
+    }
+
+    $res.Rows    = @(@($rows | Where-Object { $_.Live -eq 'Yes' } | Sort-Object Name) + @($rows | Where-Object { $_.Live -ne 'Yes' } | Sort-Object Name))
+    $res.Checked = $true
+    return $res
+}
+
+# ------------------------------------------------- cross-domain comparison --
+
+function New-PartnerData {
+    param([string]$Dns, [string]$Source)
+    [pscustomobject]@{
+        Domain    = $Dns
+        Source    = $Source
+        When      = ''
+        Ok        = $false
+        Error     = ''
+        Users     = @()      # s = account, n = name, e = enabled
+        Computers = @()      # s = name, n = operating system, e = enabled, l = last check-in
+        Policy    = [pscustomobject]@{ MinLength = $null; MaxAge = $null; LockThreshold = $null }
+    }
+}
+
+function Get-DomainHeadPolicy {
+    <#
+      Password and lockout policy as the DOMAIN ITSELF holds it - the values the
+      domain controllers enforce, whichever GPO wrote them. Readable by any
+      signed-in account, which is what makes a cross-domain comparison possible.
+    #>
+    param([string]$Path)
+    $pol = [pscustomobject]@{ MinLength = $null; MaxAge = $null; LockThreshold = $null }
+    try {
+        $h = Invoke-LdapBaseRead -Path $Path -Props @('minpwdlength', 'maxpwdage', 'lockoutthreshold')
+        if ($null -eq $h) { return $pol }
+        $v = Get-LdapVal $h 'minpwdlength'
+        if ($null -ne $v) { $pol.MinLength = [int]$v }
+        $v = Get-LdapVal $h 'lockoutthreshold'
+        if ($null -ne $v) { $pol.LockThreshold = [int]$v }
+        $v = Get-LdapVal $h 'maxpwdage'
+        if ($null -ne $v) {
+            $ticks = [int64]$v
+            # 0 and the most negative value both mean "never expires"
+            if ($ticks -eq 0 -or $ticks -eq [int64]::MinValue) { $pol.MaxAge = 0 }
+            else { $pol.MaxAge = [int][math]::Round([math]::Abs([double]$ticks) / 864000000000) }
+        }
+    }
+    catch { }
+    return $pol
+}
+
+function Get-PartnerLiveData {
+    <#
+      Read another domain directly. Only works where that domain accepts this
+      account - that is, where IT trusts US (or both are in one forest) - and
+      where selective authentication, firewalls and DNS all allow it.
+    #>
+    param([string]$Dns)
+
+    $res = New-PartnerData -Dns $Dns -Source 'Read live through the trust'
+    $res.When = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+
+    if (-not (Test-TcpPort -HostName $Dns -Port 389 -TimeoutMs 4000)) {
+        $res.Error = ('No domain controller for {0} answered on LDAP (TCP 389) from the machine that ran this report. DNS may not resolve that domain here, or a firewall sits between the two.' -f $Dns)
+        return $res
+    }
+    $dse = Get-RootDse -OnServer $Dns
+    $pdn = [string]$dse['defaultNamingContext']
+    if (-not $pdn) {
+        $res.Error = ('{0} answered but did not return its directory header.' -f $Dns)
+        return $res
+    }
+
+    try {
+        $root = Get-DsPath -Dn $pdn -OnServer $Dns
+
+        $users = @()
+        foreach ($r in @(Invoke-LdapSearch -Root $root -Filter '(&(objectCategory=person)(objectClass=user))' `
+                            -Props @('samaccountname', 'displayname', 'name', 'useraccountcontrol'))) {
+            $uac = 0; [void][int]::TryParse("$(Get-LdapVal $r 'useraccountcontrol')", [ref]$uac)
+            $nm = Get-LdapVal $r 'displayname'
+            if (-not $nm) { $nm = Get-LdapVal $r 'name' }
+            $users += [pscustomobject]@{ s = [string](Get-LdapVal $r 'samaccountname'); n = [string]$nm; e = (($uac -band 0x2) -eq 0) }
+        }
+        if ($users.Count -eq 0) {
+            $res.Error = ('{0} answered but returned no accounts to this sign-in. The trust does not run in the direction that lets this domain read it, or selective authentication is on.' -f $Dns)
+            return $res
+        }
+
+        $comps = @()
+        foreach ($r in @(Invoke-LdapSearch -Root $root -Filter '(objectCategory=computer)' `
+                            -Props @('name', 'operatingsystem', 'useraccountcontrol', 'lastlogontimestamp'))) {
+            $uac = 0; [void][int]::TryParse("$(Get-LdapVal $r 'useraccountcontrol')", [ref]$uac)
+            $ll = ConvertFrom-AdFileTime (Get-LdapVal $r 'lastlogontimestamp')
+            $comps += [pscustomobject]@{
+                s = [string](Get-LdapVal $r 'name')
+                n = [string](Get-LdapVal $r 'operatingsystem')
+                e = (($uac -band 0x2) -eq 0)
+                l = $(if ($ll) { ([datetime]$ll).ToString('yyyy-MM-dd') } else { '' })
+            }
+        }
+
+        $res.Users     = @($users)
+        $res.Computers = @($comps)
+        $res.Policy    = Get-DomainHeadPolicy -Path $root
+        $res.Ok        = $true
+    }
+    catch {
+        $res.Error = ('{0} refused the query: {1}' -f $Dns, $_.Exception.Message)
+    }
+    return $res
+}
+
+function ConvertFrom-PartnerSnapshot {
+    <# Another domain's ad-snapshot.json, in the same shape as a live read. #>
+    param($Snap, [string]$File)
+
+    $dns = [string](Get-Prop $Snap 'Domain')
+    $res = New-PartnerData -Dns $dns -Source 'Snapshot file from a separate scan of that domain'
+    $gen = Get-Prop $Snap 'Generated'
+    try { if ($gen) { $res.When = ([datetime]$gen).ToString('yyyy-MM-dd HH:mm') } } catch { }
+
+    $users = @()
+    foreach ($u in @(Get-Prop $Snap 'Users')) {
+        $s = Get-Prop $u 's'
+        if (-not $s) { continue }
+        $users += [pscustomobject]@{ s = [string]$s; n = [string](Get-Prop $u 'n'); e = [bool](Get-Prop $u 'e') }
+    }
+    $comps = @()
+    foreach ($c in @(Get-Prop $Snap 'Computers')) {
+        $s = Get-Prop $c 's'
+        if (-not $s) { continue }
+        $comps += [pscustomobject]@{ s = [string]$s; n = [string](Get-Prop $c 'n'); e = [bool](Get-Prop $c 'e'); l = [string](Get-Prop $c 'l') }
+    }
+    $res.Users     = @($users)
+    $res.Computers = @($comps)
+
+    # newer snapshots carry the policy outright; older ones only carry the GPO settings it came from
+    $pol = Get-Prop $Snap 'Policy'
+    if ($null -ne $pol) {
+        foreach ($k in @('MinLength', 'MaxAge', 'LockThreshold')) {
+            $v = Get-Prop $pol $k
+            if ($null -ne $v) { $res.Policy.$k = [int]$v }
+        }
+    }
+    else {
+        foreach ($fs in @(Get-Prop $Snap 'FocusSettings')) {
+            $n = [string](Get-Prop $fs 'n')
+            $v = [string](Get-Prop $fs 'v')
+            if     ($n -match 'MinimumPasswordLength|Minimum password length') { $res.Policy.MinLength     = Get-PwdNumber $v }
+            elseif ($n -match 'MaximumPasswordAge|Maximum password age')       { $res.Policy.MaxAge        = Get-PwdNumber $v }
+            elseif ($n -match 'LockoutBadCount|Account lockout threshold')     { $res.Policy.LockThreshold = Get-PwdNumber $v }
+        }
+    }
+
+    if ($users.Count -eq 0 -and $comps.Count -eq 0) {
+        $res.Error = ('The snapshot for {0} ({1}) holds no account list - it was produced with -SkipUserDrift or -SkipCleanup, or without Active Directory access. Re-run the scan of that domain without those switches.' -f $dns, $File)
+    }
+    else { $res.Ok = $true }
+    return $res
+}
+
+function Format-PolicyValue {
+    param([string]$Kind, $Value)
+    if ($null -eq $Value) { return 'Not available' }
+    switch ($Kind) {
+        'len'  { return ('{0} characters' -f $Value) }
+        'age'  { if ([int]$Value -eq 0) { return 'Never expires' } else { return ('{0} days' -f $Value) } }
+        'lock' { if ([int]$Value -eq 0) { return 'Disabled - accounts never lock' } else { return ('{0} failed attempts' -f $Value) } }
+    }
+    return "$Value"
+}
+
+function Compare-DomainData {
+    <# This domain against one other: who and what exists in both, and how the policies differ. #>
+    param($HereUsers, $HereComputers, $HerePolicy, $There, [string]$Relationship)
+
+    $res = [pscustomobject]@{
+        Domain       = $There.Domain
+        Relationship = $Relationship
+        Source       = $There.Source
+        When         = $There.When
+        Ok           = $There.Ok
+        Error        = $There.Error
+        UsersHere    = @($HereUsers).Count
+        UsersThere   = @($There.Users).Count
+        CompsHere    = @($HereComputers).Count
+        CompsThere   = @($There.Computers).Count
+        DupUsers     = @()
+        DupComputers = @()
+        AllUsers     = @()      # every account in either domain, marked Both / Here / There
+        AllComputers = @()      # every computer in either domain, marked Both / Here / There
+        Policy       = @()
+        PolicyDiff   = 0
+        WksHere      = @($HereComputers | Where-Object { $_.Enabled -and -not $_.IsServer }).Count
+        SrvHere      = @($HereComputers | Where-Object { $_.Enabled -and $_.IsServer }).Count
+        WksThere     = 0
+        SrvThere     = 0
+    }
+    if (-not $There.Ok) { return $res }
+
+    $res.WksThere = @($There.Computers | Where-Object { $_.e -and ("$($_.n)" -notmatch 'Server') }).Count
+    $res.SrvThere = @($There.Computers | Where-Object { $_.e -and ("$($_.n)" -match 'Server') }).Count
+
+    $thereU = @{}
+    foreach ($u in @($There.Users)) { if ($u.s) { $thereU["$($u.s)".ToLower()] = $u } }
+    $dupU = @()
+    foreach ($u in @($HereUsers)) {
+        $k = "$($u.Sam)".ToLower()
+        if (-not $k -or $k.EndsWith('$') -or ($script:BuiltinSams -contains $k)) { continue }
+        if (-not $thereU.ContainsKey($k)) { continue }
+        $o = $thereU[$k]
+        $dupU += [pscustomobject]@{
+            Sam          = $u.Sam
+            NameHere     = $u.Name
+            EnabledHere  = [bool]$u.Enabled
+            Privileged   = [string]$u.Privileged
+            NameThere    = [string]$o.n
+            EnabledThere = [bool]$o.e
+            BothEnabled  = ([bool]$u.Enabled -and [bool]$o.e)
+        }
+    }
+    $res.DupUsers = @($dupU | Sort-Object Sam)
+
+    $thereC = @{}
+    foreach ($c in @($There.Computers)) { if ($c.s) { $thereC["$($c.s)".ToLower()] = $c } }
+    $dupC = @()
+    foreach ($c in @($HereComputers)) {
+        $k = "$($c.Name)".ToLower()
+        if (-not $k -or -not $thereC.ContainsKey($k)) { continue }
+        $o  = $thereC[$k]
+        $lh = $(if ($c.LastLogon) { ([datetime]$c.LastLogon).ToString('yyyy-MM-dd') } else { '' })
+        $lt = [string]$o.l
+
+        # a computer is joined to one domain at a time, so the newer check-in is the live one
+        $live = 'Cannot tell - neither side has a check-in on record'
+        if ($lh -and $lt) {
+            if     ($lh -gt $lt) { $live = 'This domain' }
+            elseif ($lt -gt $lh) { $live = [string]$There.Domain }
+            else                 { $live = 'Same day on both' }
+        }
+        elseif ($lt) { $live = [string]$There.Domain }
+        elseif ($lh) { $live = ('Cannot tell - no check-in date was supplied for {0}' -f $There.Domain) }
+
+        $dupC += [pscustomobject]@{
+            Name         = $c.Name
+            OSHere       = [string]$c.OS
+            EnabledHere  = [bool]$c.Enabled
+            LastHere     = $lh
+            OSThere      = [string]$o.n
+            EnabledThere = [bool]$o.e
+            LastThere    = $lt
+            LiveIn       = $live
+            BothEnabled  = ([bool]$c.Enabled -and [bool]$o.e)
+        }
+    }
+    $res.DupComputers = @($dupC | Sort-Object Name)
+
+    # ---- the whole population of both domains in one list, so the split is visible
+    $hereU = @{}
+    $allU  = @()
+    foreach ($u in @($HereUsers)) {
+        $k = "$($u.Sam)".ToLower()
+        if (-not $k -or $k.EndsWith('$') -or ($script:BuiltinSams -contains $k)) { continue }
+        $hereU[$k] = $true
+        $inBoth = $thereU.ContainsKey($k)
+        $allU += [pscustomobject]@{
+            Sam          = $u.Sam
+            Name         = $u.Name
+            Where        = $(if ($inBoth) { 'Both' } else { 'Here' })
+            EnabledHere  = [bool]$u.Enabled
+            EnabledThere = $(if ($inBoth) { [bool]$thereU[$k].e } else { $null })
+            Privileged   = [string]$u.Privileged
+        }
+    }
+    foreach ($u in @($There.Users)) {
+        $k = "$($u.s)".ToLower()
+        if (-not $k -or $k.EndsWith('$') -or ($script:BuiltinSams -contains $k) -or $hereU.ContainsKey($k)) { continue }
+        $allU += [pscustomobject]@{
+            Sam = [string]$u.s; Name = [string]$u.n; Where = 'There'
+            EnabledHere = $null; EnabledThere = [bool]$u.e; Privileged = ''
+        }
+    }
+    $res.AllUsers = @($allU | Sort-Object Sam)
+
+    $hereC   = @{}
+    $allC    = @()
+    $liveMap = @{}
+    foreach ($x in $dupC) { $liveMap["$($x.Name)".ToLower()] = $x.LiveIn }
+    foreach ($c in @($HereComputers)) {
+        $k = "$($c.Name)".ToLower()
+        if (-not $k) { continue }
+        $hereC[$k] = $true
+        $inBoth = $thereC.ContainsKey($k)
+        $allC += [pscustomobject]@{
+            Name         = $c.Name
+            Where        = $(if ($inBoth) { 'Both' } else { 'Here' })
+            OS           = [string]$c.OS
+            IsServer     = [bool]$c.IsServer
+            EnabledHere  = [bool]$c.Enabled
+            LastHere     = $(if ($c.LastLogon) { ([datetime]$c.LastLogon).ToString('yyyy-MM-dd') } else { '' })
+            EnabledThere = $(if ($inBoth) { [bool]$thereC[$k].e } else { $null })
+            LastThere    = $(if ($inBoth) { [string]$thereC[$k].l } else { '' })
+            JoinedTo     = $(if ($inBoth) { [string]$liveMap[$k] } else { 'This domain' })
+        }
+    }
+    foreach ($c in @($There.Computers)) {
+        $k = "$($c.s)".ToLower()
+        if (-not $k -or $hereC.ContainsKey($k)) { continue }
+        $allC += [pscustomobject]@{
+            Name = [string]$c.s; Where = 'There'; OS = [string]$c.n; IsServer = ("$($c.n)" -match 'Server')
+            EnabledHere = $null; LastHere = ''; EnabledThere = [bool]$c.e; LastThere = [string]$c.l
+            JoinedTo = [string]$There.Domain
+        }
+    }
+    $res.AllComputers = @($allC | Sort-Object Name)
+
+    $pairs = @(
+        @{ Label = 'Minimum password length'; Kind = 'len';  Here = $HerePolicy.MinLength;     There = $There.Policy.MinLength },
+        @{ Label = 'Maximum password age';    Kind = 'age';  Here = $HerePolicy.MaxAge;        There = $There.Policy.MaxAge },
+        @{ Label = 'Account lockout threshold'; Kind = 'lock'; Here = $HerePolicy.LockThreshold; There = $There.Policy.LockThreshold }
+    )
+    $prow = @()
+    $diff = 0
+    foreach ($p in $pairs) {
+        $h = $p['Here']; $t = $p['There']
+        $state = 'Cannot compare'
+        if ($null -ne $h -and $null -ne $t) {
+            if ([int]$h -eq [int]$t) { $state = 'Same' } else { $state = 'Different'; $diff++ }
+        }
+        $prow += [pscustomobject]@{
+            Setting = $p['Label']
+            Here    = (Format-PolicyValue $p['Kind'] $h)
+            There   = (Format-PolicyValue $p['Kind'] $t)
+            State   = $state
+        }
+    }
+    $res.Policy     = @($prow)
+    $res.PolicyDiff = $diff
+    return $res
+}
+
+# ------------------------------------------- Microsoft Entra ID and Intune --
+
+function Get-EntraIntuneState {
+    <#
+      What on-premises Active Directory shows about its connection to Microsoft
+      Entra ID and Intune. AD holds the footprints of that connection - the sync
+      account, the hybrid-join pointer, the single sign-on account, the device
+      certificates, the enrollment GPO - but not the cloud side. Whether sync
+      cycles succeed, which devices Entra ID holds, and which Intune policies
+      are assigned all live in the tenant and are NOT read here.
+    #>
+    param($Users, $Computers, $Records)
+
+    $res = [pscustomobject]@{
+        Checked         = $false
+        Error           = ''
+        SyncAccounts    = @()
+        CloudSyncAgents = @()
+        SyncedUsers     = $null
+        SyncedNote      = ''
+        Sso             = $null
+        CloudKerberos   = $false
+        Scp             = [pscustomobject]@{ Checked = $false; Present = $false; TenantName = ''; TenantId = ''; Error = '' }
+        HybridComputers = $null
+        JoinGpo         = @()
+        EnrollGpo       = @()
+        EnrollState     = 'Not configured'
+        Local           = $null
+        Connected       = $false
+    }
+
+    $now = Get-Date
+
+    $dse = Get-RootDse -OnServer $script:DsServer
+    $dn  = [string]$dse['defaultNamingContext']
+    if (-not $dn) {
+        $res.Error = 'The directory did not answer an LDAP query, so the Entra ID and Intune footprints could not be read.'
+        return $res
+    }
+
+    # ---- 1. Entra Connect Sync leaves an MSOL_ (or older AAD_) account in the domain
+    foreach ($u in @($Users)) {
+        $sam = "$($u.SamAccountName)"
+        if ($sam -notmatch '^(MSOL_|AAD_)') { continue }
+        $desc   = [string](Get-Prop $u 'Description')
+        $server = ''
+        $tenant = ''
+        if ($desc -match 'running on computer\s+(\S+)') { $server = $Matches[1] }
+        if ($desc -match 'synchronize to tenant\s+(\S+)') { $tenant = $Matches[1].TrimEnd('.') }
+        $ll = Get-Prop $u 'LastLogonDate'
+        $en = Get-Prop $u 'Enabled'
+        $res.SyncAccounts += [pscustomobject]@{
+            Sam        = $sam
+            Server     = $server
+            Tenant     = $tenant
+            Enabled    = $(if ($null -ne $en) { [bool]$en } else { $true })
+            LastLogon  = $ll
+            DaysIdle   = $(if ($ll) { [int]($now - [datetime]$ll).TotalDays } else { $null })
+            PwdLastSet = (Get-Prop $u 'PasswordLastSet')
+        }
+    }
+
+    # ---- 2. Entra Cloud Sync uses a provisioning-agent gMSA instead
+    try {
+        foreach ($r in @(Invoke-LdapSearch -Root (Get-DsPath $dn) `
+                            -Filter '(&(objectClass=msDS-GroupManagedServiceAccount)(sAMAccountName=pGMSA_*))' -Props @('samaccountname', 'whencreated'))) {
+            $res.CloudSyncAgents += [string](Get-LdapVal $r 'samaccountname')
+        }
+    }
+    catch { }
+
+    # ---- 3. accounts carrying the sync anchor that Entra Connect writes back
+    try {
+        $res.SyncedUsers = @(Invoke-LdapSearch -Root (Get-DsPath $dn) `
+                                -Filter '(&(objectCategory=person)(objectClass=user)(mS-DS-ConsistencyGuid=*))' -Props @('samaccountname')).Count
+    }
+    catch { $res.SyncedNote = ('The sync anchor could not be counted: {0}' -f $_.Exception.Message) }
+
+    # ---- 4. seamless single sign-on, and the cloud Kerberos trust object
+    foreach ($c in @($Computers)) {
+        $nm = "$($c.Name)"
+        if ($nm -eq 'AZUREADSSOACC') {
+            $pls = Get-Prop $c 'PasswordLastSet'
+            $res.Sso = [pscustomobject]@{
+                PwdLastSet = $pls
+                AgeDays    = $(if ($pls) { [int]($now - [datetime]$pls).TotalDays } else { $null })
+                Enabled    = [bool](Get-Prop $c 'Enabled')
+            }
+        }
+        if ($nm -eq 'AzureADKerberos') { $res.CloudKerberos = $true }
+    }
+
+    # ---- 5. the hybrid-join pointer (service connection point) in the forest configuration
+    try {
+        $cfg = [string]$dse['configurationNamingContext']
+        if ($cfg) {
+            $res.Scp.Checked = $true
+            try {
+                $scp = Invoke-LdapBaseRead -Path (Get-DsPath ('CN=62a0ff2e-97b9-4513-943f-0d221bd30080,CN=Device Registration Configuration,CN=Services,{0}' -f $cfg)) -Props @('keywords')
+                if ($null -ne $scp) {
+                    $res.Scp.Present = $true
+                    foreach ($kw in @(Get-LdapVals $scp 'keywords')) {
+                        if ($kw -match '^azureADName:(.+)$') { $res.Scp.TenantName = $Matches[1] }
+                        if ($kw -match '^azureADId:(.+)$')   { $res.Scp.TenantId   = $Matches[1] }
+                    }
+                }
+            }
+            catch {
+                # "no such object" is the normal answer when hybrid join was never set up
+                if ("$($_.Exception.Message)" -notmatch 'no such object|0x80072030|does not exist') { $res.Scp.Error = $_.Exception.Message }
+            }
+        }
+    }
+    catch { $res.Scp.Error = $_.Exception.Message }
+
+    # ---- 6. computers that have published a device certificate - the step a machine completes for hybrid join
+    try {
+        $res.HybridComputers = @(Invoke-LdapSearch -Root (Get-DsPath $dn) `
+                                    -Filter '(&(objectCategory=computer)(userCertificate=*))' -Props @('name')).Count
+    }
+    catch { }
+
+    # ---- 7. Group Policy: device registration, and Intune automatic enrollment
+    foreach ($r in @($Records)) {
+        foreach ($sx in (@($r.Computer) + @($r.User))) {
+            $hay = ('{0} | {1}' -f $sx.Container, $sx.Name)
+            $row = $null
+            if ($hay -match 'automatic MDM enrollment|Auto MDM Enrollment|AutoEnrollMDM|Disable MDM Enrollment|Windows Components[\\/]MDM') {
+                $row = [pscustomobject]@{ What = 'Enroll'; Gpo = $r.Gpo.DisplayName; Anchor = $r.Anchor; Applying = [bool]$r.Applying
+                    LinkPaths = [string]$r.LinkPaths; Side = [string]$sx.Side; Name = [string]$sx.Name; Value = [string]$sx.Value }
+                $res.EnrollGpo += $row
+            }
+            elseif ($hay -match 'Register domain[- ]joined computers? as devices?|Device Registration|\\CDJ\\AAD|Workplace Join') {
+                $row = [pscustomobject]@{ What = 'Join'; Gpo = $r.Gpo.DisplayName; Anchor = $r.Anchor; Applying = [bool]$r.Applying
+                    LinkPaths = [string]$r.LinkPaths; Side = [string]$sx.Side; Name = [string]$sx.Name; Value = [string]$sx.Value }
+                $res.JoinGpo += $row
+            }
+        }
+    }
+    $enrollOn = @($res.EnrollGpo | Where-Object { $_.Name -match 'automatic MDM enrollment|Auto MDM Enrollment|AutoEnrollMDM' -and $_.Value -match '^\s*Enabled|\b1\b' })
+    if (@($enrollOn | Where-Object { $_.Applying }).Count -gt 0) { $res.EnrollState = 'On' }
+    elseif ($enrollOn.Count -gt 0)                               { $res.EnrollState = 'Configured but not applying' }
+    elseif (@($res.EnrollGpo).Count -gt 0)                       { $res.EnrollState = 'Present but not switched on' }
+
+    # ---- 8. this one computer's own registration state, as a single sample
+    try {
+        if (Get-Command dsregcmd.exe -ErrorAction SilentlyContinue) {
+            $lines = @(& { $ErrorActionPreference = 'Continue'; dsregcmd.exe /status 2>&1 })
+            $kv = @{}
+            foreach ($ln in $lines) {
+                if ("$ln" -match '^\s*([A-Za-z]+)\s*:\s*(.*)$') { $kv[$Matches[1]] = $Matches[2].Trim() }
+            }
+            if ($kv.Count -gt 0) {
+                $res.Local = [pscustomobject]@{
+                    Computer     = "$env:COMPUTERNAME"
+                    AzureAdJoined = $(if ($kv.ContainsKey('AzureAdJoined')) { $kv['AzureAdJoined'] } else { '' })
+                    DomainJoined = $(if ($kv.ContainsKey('DomainJoined')) { $kv['DomainJoined'] } else { '' })
+                    TenantName   = $(if ($kv.ContainsKey('TenantName')) { $kv['TenantName'] } else { '' })
+                    MdmUrl       = $(if ($kv.ContainsKey('MdmUrl')) { $kv['MdmUrl'] } else { '' })
+                }
+            }
+        }
+    }
+    catch { }
+
+    $res.Connected = ((@($res.SyncAccounts).Count -gt 0) -or (@($res.CloudSyncAgents).Count -gt 0) -or $res.Scp.Present)
+    $res.Checked   = $true
+    return $res
+}
+
+function Get-EntraSummaryRows {
+    <#
+      The six questions, each with a plain answer and the evidence behind it.
+      Used by the detailed page, the committee report and the CSV, so all three
+      say the same thing.
+    #>
+    param($State)
+
+    $rows = @()
+    $sync = @($State.SyncAccounts)
+    $live = @($sync | Where-Object { $_.Enabled -and $null -ne $_.DaysIdle -and $_.DaysIdle -le 30 })
+
+    # 1. is sync set up
+    if ($sync.Count -gt 0 -or @($State.CloudSyncAgents).Count -gt 0) {
+        $ev = @()
+        foreach ($a in $sync) {
+            $ev += ('{0}{1}{2}' -f $a.Sam, $(if ($a.Server) { ' on server ' + $a.Server } else { '' }), $(if ($a.Tenant) { ', to tenant ' + $a.Tenant } else { '' }))
+        }
+        foreach ($g in @($State.CloudSyncAgents)) { $ev += ('Cloud Sync provisioning agent account {0}' -f $g) }
+        $rows += [pscustomobject]@{ Question = 'Is directory sync to Microsoft Entra ID set up?'; Answer = 'Yes'; Tone = 'ok'
+            Evidence = ('{0} sync installation account(s) found: {1}.' -f ($sync.Count + @($State.CloudSyncAgents).Count), ($ev -join '; ')) }
+    }
+    else {
+        $rows += [pscustomobject]@{ Question = 'Is directory sync to Microsoft Entra ID set up?'; Answer = 'No sync account found'; Tone = 'bad'
+            Evidence = 'No Entra Connect Sync account (MSOL_...) and no Cloud Sync agent account (pGMSA_...) exists in this domain. Accounts here are not being synchronised to Microsoft Entra ID from this domain.' }
+    }
+
+    # 2. is it running
+    if ($sync.Count -gt 0) {
+        $ev = @()
+        foreach ($a in $sync) {
+            $ev += ('{0}: {1}{2}' -f $a.Sam,
+                $(if ($null -eq $a.DaysIdle) { 'has never signed in' } else { ('last signed in {0} day(s) ago' -f $a.DaysIdle) }),
+                $(if (-not $a.Enabled) { ', account disabled' } else { '' }))
+        }
+        $ans = 'No recent activity'; $tone = 'bad'
+        if ($live.Count -gt 0) { $ans = 'Yes, by its sign-in activity'; $tone = 'ok' }
+        $extra = ''
+        if ($sync.Count -gt 1) { $extra = (' {0} installation accounts exist. Only one sync server should be active; the others are leftovers from an earlier installation and can be removed once that is established.' -f $sync.Count) }
+        $rows += [pscustomobject]@{ Question = 'Is the sync running?'; Answer = $ans; Tone = $tone
+            Evidence = (($ev -join '; ') + '. Active Directory records sign-ins with up to a 14-day lag, and cannot show whether each sync cycle succeeds. That is on the Entra side.' + $extra) }
+    }
+    elseif (@($State.CloudSyncAgents).Count -gt 0) {
+        $rows += [pscustomobject]@{ Question = 'Is the sync running?'; Answer = 'Not visible from Active Directory'; Tone = ''
+            Evidence = 'Cloud Sync runs from an agent and reports its health in the Entra admin center. Active Directory holds no record of it.' }
+    }
+    else {
+        $rows += [pscustomobject]@{ Question = 'Is the sync running?'; Answer = 'No'; Tone = 'bad'; Evidence = 'There is no sync installation to run.' }
+    }
+
+    # 3. how many accounts are synced
+    if ($null -ne $State.SyncedUsers) {
+        $rows += [pscustomobject]@{ Question = 'How many accounts carry the sync anchor?'; Answer = ('{0} account(s)' -f $State.SyncedUsers); Tone = ''
+            Evidence = $(if ($State.SyncedUsers -eq 0 -and $sync.Count -gt 0) { 'No account carries ms-DS-ConsistencyGuid. Older installations use objectGUID as the anchor and write nothing back, so this does not prove that nothing is synced.' }
+                         else { 'Entra Connect writes ms-DS-ConsistencyGuid onto each account it synchronises. Accounts without it are not in scope of the sync, or have not been synced yet.' }) }
+    }
+
+    # 4. hybrid join
+    $joinOn = @($State.JoinGpo | Where-Object { $_.Applying })
+    if ($State.Scp.Present) {
+        $rows += [pscustomobject]@{ Question = 'Are computers set up for Entra hybrid join?'; Answer = 'Yes'; Tone = 'ok'
+            Evidence = ('The forest holds the hybrid-join pointer for tenant {0}{1}. {2}{3}' -f `
+                $(if ($State.Scp.TenantName) { $State.Scp.TenantName } else { '(name not recorded)' }),
+                $(if ($State.Scp.TenantId) { ' (' + $State.Scp.TenantId + ')' } else { '' }),
+                $(if ($null -ne $State.HybridComputers) { ('{0} computer account(s) have published a device certificate, the step a computer completes to register.' -f $State.HybridComputers) } else { '' }),
+                $(if ($joinOn.Count -gt 0) { (' Device registration is also set by Group Policy in: {0}.' -f ((@($joinOn | ForEach-Object { $_.Gpo } | Select-Object -Unique)) -join '; ')) } else { '' })) }
+    }
+    elseif ($joinOn.Count -gt 0) {
+        $rows += [pscustomobject]@{ Question = 'Are computers set up for Entra hybrid join?'; Answer = 'By Group Policy only'; Tone = 'warn'
+            Evidence = ('There is no forest-wide hybrid-join pointer, but device registration is set by Group Policy in: {0}. {1}' -f `
+                ((@($joinOn | ForEach-Object { $_.Gpo } | Select-Object -Unique)) -join '; '),
+                $(if ($null -ne $State.HybridComputers) { ('{0} computer account(s) have published a device certificate.' -f $State.HybridComputers) } else { '' })) }
+    }
+    elseif ($State.Scp.Checked) {
+        $rows += [pscustomobject]@{ Question = 'Are computers set up for Entra hybrid join?'; Answer = 'No'; Tone = 'bad'
+            Evidence = ('No hybrid-join pointer exists in the forest configuration and no applying GPO registers computers as devices. Domain computers are not being registered with Microsoft Entra ID.{0}' -f `
+                $(if ($State.HybridComputers) { (' {0} computer account(s) nonetheless hold a certificate in userCertificate, which another product may have published.' -f $State.HybridComputers) } else { '' })) }
+    }
+    else {
+        $rows += [pscustomobject]@{ Question = 'Are computers set up for Entra hybrid join?'; Answer = 'Not checked'; Tone = 'bad'
+            Evidence = ('The forest configuration could not be read. {0}' -f $State.Scp.Error) }
+    }
+
+    # 5. seamless SSO
+    if ($null -ne $State.Sso) {
+        $old = ($null -ne $State.Sso.AgeDays -and $State.Sso.AgeDays -gt 30)
+        $rows += [pscustomobject]@{ Question = 'Is seamless single sign-on enabled?'; Answer = $(if ($old) { 'Yes, key overdue for rollover' } else { 'Yes' }); Tone = $(if ($old) { 'warn' } else { 'ok' })
+            Evidence = ('The AZUREADSSOACC computer account exists. Its Kerberos key was last changed {0}. Microsoft recommends rolling that key over at least every 30 days, because anyone who obtains it can sign in to Entra ID as any synced user.' -f `
+                $(if ($null -ne $State.Sso.AgeDays) { ('{0} day(s) ago' -f $State.Sso.AgeDays) } else { 'at an unknown date' })) }
+    }
+    else {
+        $rows += [pscustomobject]@{ Question = 'Is seamless single sign-on enabled?'; Answer = 'No'; Tone = ''
+            Evidence = 'There is no AZUREADSSOACC computer account in this domain.' }
+    }
+
+    # 6. Intune auto-enrollment
+    $enr = @($State.EnrollGpo)
+    switch ($State.EnrollState) {
+        'On' {
+            $on = @($enr | Where-Object { $_.Applying })
+            $rows += [pscustomobject]@{ Question = 'Is Intune automatic enrollment switched on by Group Policy?'; Answer = 'Yes'; Tone = 'ok'
+                Evidence = ('Set in {0}, applying to: {1}.' -f ((@($on | ForEach-Object { $_.Gpo } | Select-Object -Unique)) -join '; '),
+                    ((@($on | ForEach-Object { $_.LinkPaths } | Where-Object { $_ } | Select-Object -Unique)) -join '; ')) }
+        }
+        'Configured but not applying' {
+            $rows += [pscustomobject]@{ Question = 'Is Intune automatic enrollment switched on by Group Policy?'; Answer = 'Configured but not applying'; Tone = 'warn'
+                Evidence = ('The setting exists in {0}, but that GPO is unlinked or disabled, so no computer receives it.' -f ((@($enr | ForEach-Object { $_.Gpo } | Select-Object -Unique)) -join '; ')) }
+        }
+        'Present but not switched on' {
+            $rows += [pscustomobject]@{ Question = 'Is Intune automatic enrollment switched on by Group Policy?'; Answer = 'No'; Tone = 'bad'
+                Evidence = ('MDM enrollment settings exist in {0} but none of them enables automatic enrollment.' -f ((@($enr | ForEach-Object { $_.Gpo } | Select-Object -Unique)) -join '; ')) }
+        }
+        default {
+            $rows += [pscustomobject]@{ Question = 'Is Intune automatic enrollment switched on by Group Policy?'; Answer = 'No'; Tone = 'bad'
+                Evidence = 'No GPO sets "Enable automatic MDM enrollment using default Azure AD credentials". Domain computers are not being told to enroll in Intune by Group Policy. They can still be enrolled another way, such as Autopilot, co-management or by hand.' }
+        }
+    }
+
+    # 7. are Intune policies being deployed
+    $loc = ''
+    if ($null -ne $State.Local) {
+        $loc = (' As a single sample, the computer that ran this report ({0}) reports: Entra joined {1}, domain joined {2}, MDM enrollment address {3}.' -f `
+            $State.Local.Computer, $(if ($State.Local.AzureAdJoined) { $State.Local.AzureAdJoined } else { 'not stated' }),
+            $(if ($State.Local.DomainJoined) { $State.Local.DomainJoined } else { 'not stated' }),
+            $(if ($State.Local.MdmUrl) { 'present, so it is enrolled' } else { 'absent, so it is not enrolled' }))
+    }
+    $rows += [pscustomobject]@{ Question = 'Are Intune policies being deployed?'; Answer = 'Not visible from Active Directory'; Tone = ''
+        Evidence = ('Intune policies, their assignments and each device''s compliance are held in the Microsoft 365 tenant. Nothing in Active Directory records them, so this report cannot say. Read them from the Intune admin center or a tenant-side report.' + $loc) }
+
+    return @($rows)
+}
+
+# ============================================================== gather ======
+
+$domStruct     = New-DomainStructure
+$foreignPriv   = @()
+$otherDomains  = [pscustomobject]@{ Checked = $false; Rows = @(); SidHistory = @(); Notes = @(); ProbeRan = $false; ProbeText = '' }
+$compInv       = [pscustomobject]@{ Checked = $false; Error = ''; Rows = @() }
+$domCompare    = @()      # one entry per other domain that was, or should have been, compared
+$herePolicy    = [pscustomobject]@{ MinLength = $null; MaxAge = $null; LockThreshold = $null }
+
+# ---- every computer account, for the inventory and for the comparison
+if ($adAvailable) {
+    Write-Step 'Building the full computer inventory'
+    try {
+        $ciNow  = Get-Date
+        $ciRows = @()
+        foreach ($c in @(Get-DirComputers -Server $Server)) {
+            $nm = "$($c.Name)"
+            if (-not $nm) { continue }
+            $ll = Get-Prop $c 'LastLogonDate'
+            $wc = Get-Prop $c 'whenCreated'
+            $os = [string](Get-Prop $c 'OperatingSystem')
+            $ou = (("$($c.DistinguishedName)" -split ',', 2)[1])
+            $ciRows += [pscustomobject]@{
+                Name        = $nm
+                DnsName     = [string](Get-Prop $c 'DNSHostName')
+                OS          = $os
+                Enabled     = [bool](Get-Prop $c 'Enabled')
+                IsServer    = ($os -match 'Server')
+                IsDc        = ("$ou" -match '^OU=Domain Controllers,')
+                OU          = $ou
+                LastLogon   = $ll
+                DaysIdle    = $(if ($ll) { [int]($ciNow - [datetime]$ll).TotalDays } elseif ($wc) { [int]($ciNow - [datetime]$wc).TotalDays } else { $null })
+                PwdLastSet  = (Get-Prop $c 'PasswordLastSet')
+                Created     = $wc
+                Description = [string](Get-Prop $c 'Description')
+                InOther     = ''
+            }
+        }
+        $compInv.Rows    = @($ciRows | Sort-Object Name)
+        $compInv.Checked = $true
+    }
+    catch { $compInv.Error = $_.Exception.Message; Write-Warn ("Computer inventory failed: {0}" -f $_.Exception.Message) }
+}
+else { $compInv.Error = $script:AdSkipReason }
+
+if ($SkipDomainStructure) {
+    $domStruct.Error = 'Skipped - the report was run with -SkipDomainStructure.'
+}
+elseif (-not $adAvailable) {
+    $domStruct.Error = $script:AdSkipReason
+}
+else {
+    Write-Step 'Reading forest structure and trusts'
+    try { $domStruct = Get-DomainStructure }
+    catch {
+        $domStruct = New-DomainStructure
+        $domStruct.Error = $_.Exception.Message
+        Write-Warn ("Forest and trust discovery failed: {0}" -f $_.Exception.Message)
+    }
+
+    if ($domStruct.Checked) {
+        foreach ($t in @($domStruct.Trusts)) {
+            if ($t.TrustAccount) { $script:TrustAccounts["$($t.TrustAccount)".ToLower()] = $t.Partner }
+        }
+
+        try { $foreignPriv = @(Get-ForeignPrivilegedMembers -Structure $domStruct) }
+        catch { Write-Warn ("Foreign privileged-member check failed: {0}" -f $_.Exception.Message) }
+
+        Write-Step 'Looking for evidence of other Active Directory domains'
+        if ($ProbeSubnets) { Write-Step '              -ProbeSubnets is on: testing TCP 389 across the local /24 subnet(s)' }
+        try {
+            $otherDomains = Get-OtherDomainIndicators -Structure $domStruct -Users @(Get-DirUsers -Server $Server) `
+                                -Computers @(Get-DirComputers -Server $Server) -Settings $flatSettings -Probe:$ProbeSubnets
+        }
+        catch { Write-Warn ("Other-domain indicator search failed: {0}" -f $_.Exception.Message) }
+
+        $herePolicy = Get-DomainHeadPolicy -Path (Get-DsPath $domStruct.DomainDn)
+    }
+}
+
+# the GPO-derived values stand in where the domain head could not be read
+if ($null -eq $herePolicy.MinLength -and @($pwdStates).Count -gt 0) { $herePolicy.MinLength = $pwdStates[0].MinLength }
+if ($null -eq $herePolicy.MaxAge    -and @($pwdStates).Count -gt 0) { $herePolicy.MaxAge    = $pwdStates[0].MaxAge }
+if ($null -eq $herePolicy.LockThreshold) {
+    $lk = @($focus['lockout'] | Where-Object { $_.Applying -and $_.Name -match 'LockoutBadCount|Account lockout threshold' })
+    if ($lk.Count -gt 0) { $herePolicy.LockThreshold = Get-PwdNumber $lk[0].Value }
+}
+
+# ---- which other domains are there to compare against, and from what source
+if (-not $SkipDomainStructure -and $adAvailable -and $userInv.Checked) {
+
+    $thisLower = "$($domStruct.ThisDns)".ToLower()
+    if (-not $thisLower) { $thisLower = "$Domain".ToLower() }
+
+    # snapshots of OTHER domains: named on the command line, or sitting under the output folder
+    $snapFiles = @()
+    foreach ($cp in @($CompareSnapshot)) {
+        if (-not $cp) { continue }
+        try {
+            if (Test-Path -LiteralPath $cp -PathType Leaf) { $snapFiles += (Resolve-Path -LiteralPath $cp).Path }
+            elseif (Test-Path -LiteralPath $cp -PathType Container) {
+                $snapFiles += @(Get-ChildItem -LiteralPath $cp -Filter 'ad-snapshot.json' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                                    ForEach-Object { $_.FullName })
+            }
+            else { Write-Warn ("-CompareSnapshot path not found: {0}" -f $cp) }
+        }
+        catch { Write-Warn ("-CompareSnapshot path could not be read: {0}" -f $cp) }
+    }
+    foreach ($d in @(Get-ChildItem -Path $OutputPath -Directory -Filter 'AD-Report-*' -ErrorAction SilentlyContinue)) {
+        $f = Join-Path $d.FullName 'ad-snapshot.json'
+        if (Test-Path -LiteralPath $f) { $snapFiles += $f }
+    }
+
+    $snapByDomain = @{}
+    foreach ($f in @($snapFiles | Select-Object -Unique)) {
+        try {
+            $sn  = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+            $sd  = "$(Get-Prop $sn 'Domain')".ToLower()
+            $gen = Get-Prop $sn 'Generated'
+            if (-not $sd -or $sd -eq $thisLower -or $sd -eq "$Domain".ToLower() -or -not $gen) { continue }
+            $when = [datetime]$gen
+            if (-not $snapByDomain.ContainsKey($sd) -or $snapByDomain[$sd].When -lt $when) {
+                $snapByDomain[$sd] = [pscustomobject]@{ Snap = $sn; File = $f; When = $when }
+            }
+        }
+        catch { }
+    }
+
+    # connected domains, with how each relates to this one
+    $connected = [ordered]@{}
+    foreach ($d in @($domStruct.ForestDomains)) {
+        if ($d.IsThis -or -not $d.Dns) { continue }
+        $connected["$($d.Dns)".ToLower()] = [pscustomobject]@{ Dns = $d.Dns; Relationship = ('{0} (same forest)' -f $d.Relation); CanReadLive = $true }
+    }
+    foreach ($t in @($domStruct.Trusts)) {
+        if (-not $t.Partner) { continue }
+        $k = "$($t.Partner)".ToLower()
+        if ($connected.Contains($k)) { continue }
+        $connected[$k] = [pscustomobject]@{ Dns = $t.Partner; Relationship = ('{0} - {1}' -f $t.Kind, $t.Direction); CanReadLive = [bool]$t.TrustsIn }
+    }
+    foreach ($k in @($snapByDomain.Keys)) {
+        if ($connected.Contains($k)) { continue }
+        $connected[$k] = [pscustomobject]@{ Dns = $k; Relationship = 'No trust or forest relationship was found - compared because a scan of it was supplied'; CanReadLive = $false }
+    }
+
+    $hereUsers = @($userInv.Rows)
+    $hereComps = @($compInv.Rows)
+
+    foreach ($k in @($connected.Keys)) {
+        $cd      = $connected[$k]
+        $partner = $null
+        $liveErr = ''
+
+        if ($cd.CanReadLive) {
+            Write-Step ("Reading connected domain {0} through the trust" -f $cd.Dns)
+            try { $partner = Get-PartnerLiveData -Dns $cd.Dns } catch { $partner = $null; $liveErr = $_.Exception.Message }
+            if ($null -ne $partner -and -not $partner.Ok) { $liveErr = $partner.Error; $partner = $null }
+        }
+        else {
+            $liveErr = ('{0} does not accept sign-ins from this domain, so it cannot be read from here through the trust.' -f $cd.Dns)
+        }
+
+        if ($null -eq $partner -and $snapByDomain.ContainsKey($k)) {
+            $partner = ConvertFrom-PartnerSnapshot -Snap $snapByDomain[$k].Snap -File $snapByDomain[$k].File
+        }
+        if ($null -eq $partner) {
+            $partner = New-PartnerData -Dns $cd.Dns -Source 'Not compared'
+            $partner.Error = ('{0} No snapshot file for {1} was found either. Run this script in {1} and pass its ad-snapshot.json to -CompareSnapshot, or copy its report folder next to this one.' -f $liveErr, $cd.Dns).Trim()
+        }
+
+        $domCompare += (Compare-DomainData -HereUsers $hereUsers -HereComputers $hereComps -HerePolicy $herePolicy `
+                            -There $partner -Relationship $cd.Relationship)
+    }
+
+    # mark computers that also exist in another domain, for the inventory filter
+    $dupNames = @{}
+    foreach ($dc in @($domCompare)) {
+        foreach ($x in @($dc.DupComputers)) { $dupNames["$($x.Name)".ToLower()] = $dc.Domain }
+    }
+    foreach ($r in @($compInv.Rows)) {
+        $k = "$($r.Name)".ToLower()
+        if ($dupNames.ContainsKey($k)) { $r.InOther = [string]$dupNames[$k] }
+    }
+}
+
+# what Active Directory shows of the connection to Microsoft Entra ID and Intune
+$entra = [pscustomobject]@{
+    Checked = $false; Error = ''; Connected = $false; EnrollState = 'Not configured'
+    SyncAccounts = @(); CloudSyncAgents = @(); SyncedUsers = $null; HybridComputers = $null
+    JoinGpo = @(); EnrollGpo = @(); Local = $null; Sso = $null; CloudKerberos = $false
+    Scp = [pscustomobject]@{ Checked = $false; Present = $false; TenantName = ''; TenantId = ''; Error = '' }
+}
+$entraRows = @()
+if ($adAvailable) {
+    Write-Step 'Reading Entra ID and Intune footprints in the directory'
+    try {
+        $entra = Get-EntraIntuneState -Users @(Get-DirUsers -Server $Server) -Computers @(Get-DirComputers -Server $Server) -Records $records
+        if ($entra.Checked) { $entraRows = @(Get-EntraSummaryRows -State $entra) }
+    }
+    catch {
+        $entra.Error = $_.Exception.Message
+        Write-Warn ("Entra ID and Intune check failed: {0}" -f $_.Exception.Message)
+    }
+}
+else { $entra.Error = $script:AdSkipReason }
+
+# removable storage, resolved down to each user and each computer
+$msAffected = [pscustomobject]@{ Checked = $false; Rows = @(); Notes = @(); CompSide = 0; UserSide = 0 }
+if ($userInv.Checked -or $compInv.Checked) {
+    Write-Step 'Resolving removable-storage policy to users and computers'
+    try {
+        $msAffected = Get-MassStorageAffected -Review $msReview -Users @($userInv.Rows) -Computers @($compInv.Rows) -ThisDns "$($domStruct.ThisDns)"
+    }
+    catch { Write-Warn ("Mass storage resolution failed: {0}" -f $_.Exception.Message) }
+}
+
+# every domain this one is connected to, by forest or by trust
+$connectedNames = @()
+foreach ($d in @($domStruct.ForestDomains)) { if (-not $d.IsThis -and $d.Dns -and $connectedNames -notcontains $d.Dns) { $connectedNames += $d.Dns } }
+foreach ($t in @($domStruct.Trusts))        { if ($t.Partner -and $connectedNames -notcontains $t.Partner) { $connectedNames += $t.Partner } }
 
 $svcReview = $null
 if (-not $SkipServiceAccounts -and $adAvailable) {
@@ -2779,14 +4569,15 @@ nav.side a.nav:hover{background:var(--chip)}
 nav.side a.nav.on{background:var(--accent);color:var(--onacc)}
 nav.side a.nav.on .n{color:var(--onacc);opacity:.85}
 nav.side .n{color:var(--mut);font-size:11.5px;font-variant-numeric:tabular-nums;white-space:nowrap}
-nav.side .grouplbl{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;padding:14px 10px 4px;font-weight:700}
+nav.side .grouplbl{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:0 2px 5px;margin:18px 8px 6px;font-weight:700;border-bottom:1px solid var(--accent)}
 nav.side hr{border:none;border-top:1px solid var(--line);margin:12px 4px}
 nav.side .navnote{color:var(--mut);font-size:11.5px;padding:4px 10px;line-height:1.45}
 main{flex:1 1 auto;min-width:0;padding:20px 26px 60px;max-width:1400px}
 section.view{display:none}
 section.view.on{display:block}
-h1{margin:0 0 4px;font-size:20px}
-h2{margin:26px 0 10px;font-size:16px}
+h1{margin:0 0 10px;padding-bottom:8px;font-size:22px;font-weight:600;color:var(--accent);border-bottom:2px solid var(--accent)}
+h2{margin:30px 0 12px;padding-bottom:6px;font-size:17px;font-weight:600;color:var(--accent);border-bottom:1px solid var(--accent)}
+section.view>h3{color:var(--accent);padding-bottom:5px;border-bottom:1px solid var(--line)}
 .sub{color:var(--mut);font-size:13px}
 .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;position:sticky;top:0;background:var(--bg);padding:12px 0;margin-bottom:6px;z-index:5;border-bottom:1px solid var(--line)}
 .toolbar input[type=search]{flex:1 1 300px;min-width:200px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
@@ -2892,11 +4683,11 @@ button.btn:hover{border-color:var(--accent);color:var(--accent)}
 .tbl th{text-align:left;padding:8px 10px;background:var(--chip);color:var(--mut);border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.03em;position:sticky;top:0}
 .tbl td{padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}
 .tblbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0 12px}
-.stat.statf{cursor:pointer;user-select:none;transition:border-color .12s,box-shadow .12s}
-.stat.statf:hover{border-color:var(--accent)}
-.stat.statf:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.stat.statf.on{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
-.stat.statf.on b{color:var(--accent)}
+.stat.statf,.stat.statt{cursor:pointer;user-select:none;transition:border-color .12s,box-shadow .12s}
+.stat.statf:hover,.stat.statt:hover{border-color:var(--accent)}
+.stat.statf:focus-visible,.stat.statt:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.stat.statf.on,.stat.statt.on{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.stat.statf.on b,.stat.statt.on b{color:var(--accent)}
 table.grid{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:12.5px;margin:10px 0 6px}
 table.grid th{text-align:left;padding:8px 10px;background:var(--chip);color:var(--mut);border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.03em}
 table.grid td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;line-height:1.5}
@@ -3146,6 +4937,8 @@ function applyTblFilter(sel){
         if (cb.checked && r.dataset[cb.dataset.attr] !== cb.dataset.val) ok = false;
       });
     }
+    if (ok && t.dataset.tattr  && r.dataset[t.dataset.tattr]  !== t.dataset.tval)  ok = false;
+    if (ok && t.dataset.tattr2 && r.dataset[t.dataset.tattr2] !== t.dataset.tval2) ok = false;
     r.style.display = ok ? '' : 'none';
     if (ok) n++;
   });
@@ -3153,6 +4946,18 @@ function applyTblFilter(sel){
     var c = document.getElementById(inp.dataset.count);
     if (c) c.textContent = n;
   }
+}
+function setTileFilter(tile){
+  var sel = tile.dataset.target;
+  var t = document.querySelector(sel);
+  if (!t) return;
+  var slot = tile.dataset.slot || '';
+  t.dataset['tattr' + slot] = tile.dataset.attr || '';
+  t.dataset['tval' + slot]  = tile.dataset.val  || '';
+  document.querySelectorAll('.statt[data-target="' + sel + '"]').forEach(function(s){
+    if ((s.dataset.slot || '') === slot) s.classList.toggle('on', s === tile);
+  });
+  applyTblFilter(sel);
 }
 function applyInvFilter(){
   var q = document.getElementById('qInv');
@@ -3320,6 +5125,14 @@ document.addEventListener('DOMContentLoaded', function(){
   document.querySelectorAll('input.tblf').forEach(function(cb){
     cb.addEventListener('change', function(){ applyTblFilter(cb.dataset.filterTarget); });
   });
+  document.querySelectorAll('.statt').forEach(function(s){
+    s.addEventListener('click', function(){ setTileFilter(s); });
+    s.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setTileFilter(s); }
+    });
+  });
+  // a tile that is lit when the page opens is a default filter - apply it
+  document.querySelectorAll('.statt.on').forEach(function(s){ if (s.dataset.attr) setTileFilter(s); });
   wireTools();
   document.getElementById('bExpand').addEventListener('click', function(){ setAll(true); });
   document.getElementById('bCollapse').addEventListener('click', function(){ setAll(false); });
@@ -3509,22 +5322,41 @@ if (-not $SkipPrivilegedGroups) {
     }
     A ("<a class='nav' data-view='priv' href='#'>Privileged groups<span class='n'>{0}</span></a>" -f $privTotal)
 }
-$lrCount = if ($logonScan) { $logonScan.Rows.Count } else { '&ndash;' }
-A ("<a class='nav' data-view='logon' href='#'>Logon restrictions<span class='n'>{0}</span></a>" -f $lrCount)
 
 $svcCount = '&ndash;'
 if ($svcReview.Checked) { $svcCount = @($svcReview.Accounts).Count }
 A ("<a class='nav' data-view='svcacct' href='#'>Service accounts<span class='n'>{0}</span></a>" -f $svcCount)
+
+$lrCount = if ($logonScan) { $logonScan.Rows.Count } else { '&ndash;' }
+A ("<a class='nav' data-view='logon' href='#'>Logon restrictions<span class='n'>{0}</span></a>" -f $lrCount)
 A ("<a class='nav' data-view='massstorage' href='#'>Mass storage<span class='n'>{0}</span></a>" -f @($msReview.Rows).Count)
 
-A '<div class="grouplbl">Inventory</div>'
-A ("<a class='nav' data-view='gpos' href='#'>All GPOs<span class='n'>{0}</span></a>" -f $records.Count)
-A ("<a class='nav' data-view='scope' href='#'>Scope index<span class='n'>{0}</span></a>" -f @($flatScope | Where-Object { $_.SOMPath -ne '(not linked)' }).Count)
-A ("<a class='nav' data-view='unlinked' href='#'>Unlinked GPOs<span class='n'>{0}</span></a>" -f $unlinked.Count)
+# Domain structure: always present, because "stands alone, no trusts" is itself
+# a statement the reviewer needs. The comparison page only exists when there is
+# another domain to compare against.
+A '<div class="grouplbl">Domain structure</div>'
+$navConn = '&ndash;'
+if ($domStruct.Checked) {
+    $navNames = @()
+    foreach ($d in @($domStruct.ForestDomains)) { if (-not $d.IsThis -and $d.Dns -and $navNames -notcontains $d.Dns) { $navNames += $d.Dns } }
+    foreach ($t in @($domStruct.Trusts))        { if ($t.Partner -and $navNames -notcontains $t.Partner) { $navNames += $t.Partner } }
+    $navConn = $navNames.Count
+}
+A ("<a class='nav' data-view='structure' href='#'>Forest &amp; trusts<span class='n'>{0}</span></a>" -f $navConn)
+A ("<a class='nav' data-view='compare' href='#'>Domain comparison<span class='n'>{0}</span></a>" -f @($domCompare).Count)
+A ("<a class='nav' data-view='entra' href='#'>Entra ID &amp; Intune<span class='n'>{0}</span></a>" -f `
+    $(if (-not $entra.Checked) { '&ndash;' } elseif ($entra.Connected) { 'Yes' } else { 'No' }))
 
+A '<div class="grouplbl">Inventory</div>'
 $invCount = '&ndash;'
 if ($userInv.Checked) { $invCount = @($userInv.Rows).Count }
 A ("<a class='nav' data-view='allusers' href='#'>All users<span class='n'>{0}</span></a>" -f $invCount)
+$compCount = '&ndash;'
+if ($compInv.Checked) { $compCount = @($compInv.Rows).Count }
+A ("<a class='nav' data-view='allcomputers' href='#'>All computers<span class='n'>{0}</span></a>" -f $compCount)
+A ("<a class='nav' data-view='gpos' href='#'>All GPOs<span class='n'>{0}</span></a>" -f $records.Count)
+A ("<a class='nav' data-view='scope' href='#'>Scope index<span class='n'>{0}</span></a>" -f @($flatScope | Where-Object { $_.SOMPath -ne '(not linked)' }).Count)
+A ("<a class='nav' data-view='unlinked' href='#'>Unlinked GPOs<span class='n'>{0}</span></a>" -f $unlinked.Count)
 
 if (-not $SkipCleanup) {
     A '<div class="grouplbl">Cleanup</div>'
@@ -3890,7 +5722,7 @@ $msRows = @($msReview.Rows)
 $msGpos = @($msReview.Gpos)
 
 if ($msGpos.Count -eq 0) {
-    A '<div class="missing" style="margin-left:0"><b>No Group Policy Object in this domain configures removable storage at all.</b> Nothing denies USB mass storage, external drives or optical media, so every computer and every user may read from and write to removable media. There is no exception list to review because there is no restriction to be excepted from.</div>'
+    A '<div class="missing" style="margin-left:0"><b>No Group Policy Object in this domain denies or permits removable storage.</b> Nothing denies USB mass storage, external drives or optical media, so every computer and every user may read from and write to removable media. There is no exception list to review because there is no restriction to be excepted from.</div>'
 }
 else {
     $msRestr = @($msRows | Where-Object { $_.Effect -eq 'Restricted' })
@@ -3906,6 +5738,7 @@ else {
         A ("<div class='missing' style='margin-left:0'><b>Removable storage is configured but nothing is enforcing it.</b> {0} GPO(s) carry removable-storage settings, but none of them is both linked and enabled, so no computer or user in the domain is actually denied removable media.</div>" -f $msGpos.Count)
     }
 
+    A '<h2>What the policy targets</h2>'
     A '<div class="stats">'
     A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter the list below. The view opens on the exceptions and allowed usage.</div>'
     $msTiles = @(
@@ -3986,6 +5819,525 @@ else {
     A '<div class="hint" style="margin-left:0">This page reads Group Policy only. It does not detect removable-storage controls enforced by an endpoint agent, a DLP product or BitLocker To Go, so a target listed as allowed here may still be blocked by something outside Active Directory. Confirm against the tools in use before reporting it as a gap.</div>'
     A '</div>'
 }
+
+if (@($msReview.Related).Count -gt 0) {
+    A ("<div class='sub' style='margin-top:14px'>{0} other GPO(s) hold settings about removable media that neither deny nor permit access &ndash; auditing, BitLocker recovery, CD-ROM sharing or who may eject a disk &ndash; and are not counted as restrictions: {1}.</div>" -f `
+        @($msReview.Related).Count, (HtmlEnc ((@($msReview.Related | ForEach-Object { $_.Gpo })) -join '; ')))
+}
+
+# ---- every user and computer, resolved against the policies above
+A '<h2>Who is affected: users and computers</h2>'
+if (-not $msAffected.Checked) {
+    A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; the user and computer lists were not available. {0}</div>" -f (HtmlEnc $script:AdSkipReason))
+}
+else {
+    $afRows   = @($msAffected.Rows)
+    $afDenied = @($afRows | Where-Object { $_.Effect -eq 'Denied' })
+    $afExc    = @($afRows | Where-Object { $_.Effect -eq 'Exception' })
+    $afFollow = @($afRows | Where-Object { $_.Effect -eq 'Follows the computer' })
+    $afOpen   = @($afRows | Where-Object { $_.Effect -eq 'Allowed' -or $_.Effect -eq 'Exception' })
+    $afUsers  = @($afRows | Where-Object { $_.Kind -eq 'User' })
+    $afComps  = @($afRows | Where-Object { $_.Kind -eq 'Computer' })
+
+    A '<div class="sub">Every user account and every computer account, resolved against the policies above. A deny set under Computer Configuration lands on the computer, whoever signs in to it. A deny set under User Configuration lands on the user, whichever computer they use. An account is an <b>Exception</b> when a restricting GPO is linked above it but the security filtering leaves it out, or explicitly denies it Apply.</div>'
+
+    if ($msAffected.CompSide -eq 0 -and $msAffected.UserSide -eq 0) {
+        A '<div class="missing" style="margin-left:0;margin-top:10px"><b>No applying GPO denies removable storage.</b> Every user and every computer below is allowed to use USB mass storage as far as Group Policy is concerned.</div>'
+    }
+    elseif ($msAffected.UserSide -eq 0) {
+        A '<div class="note" style="margin-left:0">Every restriction in force is set under Computer Configuration, so it follows the computer rather than the person. Users are listed as <b>Follows the computer</b>: denied on a computer in the Denied list, allowed on any other. The Computers filter shows where USB storage is blocked.</div>'
+    }
+
+    A '<div class="stats">'
+    A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter. The first row filters by outcome, the second by account type, and the two combine. The list opens on allowed usage and exceptions.</div>'
+    $afTiles = @(
+        @{ N = $afOpen.Count;   L = 'Allowed &amp; exceptions'; A = 'open'; V = '1';         O = $true },
+        @{ N = $afDenied.Count; L = 'Denied';                   A = 'eff';  V = 'Denied';    O = $false },
+        @{ N = $afExc.Count;    L = 'Exceptions';               A = 'eff';  V = 'Exception'; O = $false }
+    )
+    if ($afFollow.Count -gt 0) { $afTiles += @{ N = $afFollow.Count; L = 'Follows the computer'; A = 'eff'; V = 'Follows'; O = $false } }
+    $afTiles += @{ N = $afRows.Count; L = 'Every account'; A = ''; V = ''; O = $false }
+    foreach ($t in $afTiles) {
+        A ("<div class='stat statt{4}' data-target='#tbl-msaff' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+            $t['N'], $t['L'], $t['A'], $t['V'], $(if ($t['O']) { ' on' } else { '' }))
+    }
+    A '</div>'
+    A '<div class="stats" style="margin-top:-6px">'
+    foreach ($t in @(
+            @{ N = $afRows.Count;  L = 'Users and computers'; A = '';     V = '';         O = $true },
+            @{ N = $afUsers.Count; L = 'Users';               A = 'kind'; V = 'User';     O = $false },
+            @{ N = $afComps.Count; L = 'Computers';           A = 'kind'; V = 'Computer'; O = $false })) {
+        A ("<div class='stat statt{4}' data-target='#tbl-msaff' data-slot='2' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+            $t['N'], $t['L'], $t['A'], $t['V'], $(if ($t['O']) { ' on' } else { '' }))
+    }
+    A '</div>'
+
+    A '<div class="tblbar"><input class="tblq" type="search" data-target="#tbl-msaff" data-count="cnt-msaff" placeholder="Filter by name, account, OU or reason...">'
+    A ("<span class='sub'><b id='cnt-msaff'>{0}</b> shown</span>" -f $afOpen.Count)
+    A ("<button type='button' class='btnCsv noprint' data-table='tbl-msaff' data-file='MassStorage-Affected-{0}-{1}.csv'>Export this view to CSV</button>" -f `
+        ($Domain -replace '[^\w\.\-]', '_'), (Get-Date -Format 'yyyyMMdd'))
+    A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
+
+    A '<table class="tbl" id="tbl-msaff"><tr><th>Name</th><th>Account</th><th>Type</th><th>Removable storage</th><th>Why</th><th>State</th><th>OU</th></tr>'
+    foreach ($r in $afRows) {
+        $k = (@($r.Name, $r.Sam, $r.Kind, $r.Effect, $r.Why, $r.OU, $r.Detail) -join ' ')
+        $effKey = $(if ($r.Effect -eq 'Follows the computer') { 'Follows' } else { [string]$r.Effect })
+        $eff = switch ($r.Effect) {
+            'Denied'    { '<span class="badge ok">Denied</span>' }
+            'Exception' { '<span class="badge bad">Exception</span>' }
+            'Allowed'   { '<span class="badge warn">Allowed</span>' }
+            default     { '<span class="badge">Follows the computer</span>' }
+        }
+        A ("<tr class='row' data-k='{0}' data-eff='{1}' data-open='{2}' data-kind='{3}'><td>{4}</td><td class='mono'>{5}</td><td>{6}</td><td>{7}</td><td style='font-size:12px'>{8}</td><td>{9}</td><td class='mono'>{10}</td></tr>" -f `
+            (HtmlEnc $k), $effKey,
+            $(if ($r.Effect -eq 'Allowed' -or $r.Effect -eq 'Exception') { '1' } else { '0' }),
+            (HtmlEnc $r.Kind), (HtmlEnc $r.Name), (HtmlEnc $r.Sam), (HtmlEnc $r.Kind), $eff, (HtmlEnc $r.Why),
+            $(if ($r.Enabled) { 'Enabled' } else { '<span class="badge">Disabled</span>' }),
+            (HtmlEnc $r.OU))
+    }
+    A '</table>'
+
+    foreach ($n in @($msAffected.Notes)) { A ("<div class='note' style='margin-left:0'>{0}</div>" -f (HtmlEnc $n)) }
+    A '<div class="sub" style="margin-top:8px">How this list is worked out: a GPO reaches an account when it is linked to the domain or an OU above the account and its security filtering includes the account, directly or through a group at any depth. Block Inheritance set on an OU is not taken into account, so an account under a blocked OU can show as Denied when the policy does not reach it. Confirm a sample on the machine with gpresult before relying on a single row.</div>'
+}
+A '</section>'
+
+# ============================================ VIEW: FOREST AND TRUSTS ======
+
+function Get-CompareStateHtml {
+    <# Was this other domain covered alongside this report, and from what source? #>
+    param([string]$Dns)
+    foreach ($dc in @($domCompare)) {
+        if ("$($dc.Domain)" -eq "$Dns") {
+            if ($dc.Ok) {
+                return ("<span class='badge ok'>Compared</span><div class='mut' style='font-size:11px'>{0}, {1}</div>" -f (HtmlEnc $dc.Source), (HtmlEnc $dc.When))
+            }
+            return "<span class='badge bad'>Not scanned</span><div class='mut' style='font-size:11px'>Needs its own scan</div>"
+        }
+    }
+    return "<span class='badge bad'>Not scanned</span><div class='mut' style='font-size:11px'>Needs its own scan</div>"
+}
+
+A '<section class="view" id="view-structure">'
+A '<h1>Forest and trusts</h1>'
+A '<div class="sub">Where this domain sits, what it is connected to, and what that means for the scope of this report. Group Policy stops at the domain boundary: nothing configured in this domain applies to any other domain, parent or child, and nothing in another domain applies here. What does cross a boundary is sign-in, through a trust or a shared forest, so a connected domain with weaker controls is exposure for this one.</div>'
+A '<div style="height:14px"></div>'
+
+if (-not $domStruct.Checked) {
+    A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; {0}</div>" -f (HtmlEnc $domStruct.Error))
+}
+else {
+    $stTrusts = @($domStruct.Trusts)
+    $stForest = @($domStruct.ForestDomains)
+    $stOthers = @($stForest | Where-Object { -not $_.IsThis })
+    $stExt    = @($stTrusts | Where-Object { -not $_.WithinForest })
+    $stNotCmp = @($domCompare | Where-Object { -not $_.Ok })
+    $stLive   = @($otherDomains.Rows | Where-Object { $_.Live -eq 'Yes' })
+
+    A '<div class="stats">'
+    A ("<div class='stat'><b>{0}</b><span>Domains in this forest</span></div>" -f $(if ($stForest.Count -gt 0) { $stForest.Count } else { 1 }))
+    A ("<div class='stat'><b>{0}</b><span>Trusts outside the forest</span></div>" -f $stExt.Count)
+    A ("<div class='stat'><b style='color:{1}'>{0}</b><span>Connected domains not scanned</span></div>" -f $stNotCmp.Count, $(if ($stNotCmp.Count -gt 0) { 'var(--bad)' } else { 'var(--ok)' }))
+    A ("<div class='stat'><b style='color:{1}'>{0}</b><span>Outside accounts with privilege here</span></div>" -f @($foreignPriv).Count, $(if (@($foreignPriv).Count -gt 0) { 'var(--bad)' } else { 'var(--ok)' }))
+    A ("<div class='stat'><b>{0}</b><span>Unconnected domains indicated</span></div>" -f $stLive.Count)
+    A '</div>'
+
+    # ---- where it sits, and what this report does and does not cover
+    A '<h2>Where this domain sits</h2>'
+    A '<div class="area">'
+    A ("<h3><span class='badge ok'>{0}</span> {1}</h3>" -f (HtmlEnc $domStruct.Position), (HtmlEnc $domStruct.ThisDns))
+    A ("<div class='hint' style='margin-left:0'><b>{0}</b> is {1}. Forest: <b>{2}</b>.</div>" -f `
+        (HtmlEnc $domStruct.ThisDns), (HtmlEnc $domStruct.PositionText), (HtmlEnc $domStruct.ForestRoot))
+
+    $connNames = @()
+    foreach ($d in $stOthers) { if ($d.Dns -and $connNames -notcontains $d.Dns) { $connNames += $d.Dns } }
+    foreach ($t in $stTrusts) { if ($t.Partner -and $connNames -notcontains $t.Partner) { $connNames += $t.Partner } }
+
+    if ($connNames.Count -eq 0) {
+        A '<div class="verified">This domain stands alone: there is no other domain in its forest and it has no trusts. Nothing outside it can sign in here through Active Directory, and this report covers the whole directory.</div>'
+    }
+    else {
+        A ("<div class='missing' style='margin-left:0'>This report covers <b>{0}</b> only. It is connected to {1} other domain(s): <b>{2}</b>. Their Group Policy, password policy, privileged groups and accounts are NOT in this report. Each one needs its own scan before the review of this environment is complete.</div>" -f `
+            (HtmlEnc $domStruct.ThisDns), $connNames.Count, (HtmlEnc ($connNames -join ', ')))
+    }
+    A '</div>'
+
+    if ($stForest.Count -gt 1) {
+        A '<h2>Domains in this forest</h2>'
+        A '<table class="grid"><thead><tr><th>Domain</th><th>NetBIOS name</th><th>Relationship to this domain</th><th>Covered with this report?</th></tr></thead><tbody>'
+        foreach ($d in $stForest) {
+            A ("<tr><td><b>{0}</b></td><td class='mono'>{1}</td><td>{2}</td><td>{3}</td></tr>" -f `
+                (HtmlEnc $d.Dns), (HtmlEnc $d.NetBios), (HtmlEnc $d.Relation),
+                $(if ($d.IsThis) { "<span class='badge ok'>This report</span>" } else { Get-CompareStateHtml $d.Dns }))
+        }
+        A '</tbody></table>'
+    }
+
+    # ---- trusts
+    A '<h2>Trusts</h2>'
+    if (-not $domStruct.TrustsChecked) {
+        A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; the trust objects could not be read: {0}</div>" -f (HtmlEnc $domStruct.TrustsError))
+    }
+    elseif ($stTrusts.Count -eq 0) {
+        A '<div class="verified">No trusts are defined. No account from any other domain can be given access here, and no account from this domain can be given access anywhere else.</div>'
+    }
+    else {
+        A '<div class="sub">A trust decides whose accounts can sign in where. It moves sign-ins, not policy: the trusted domain keeps its own password rules, and an account that is weak there is weak here once it has been granted access.</div>'
+        A '<table class="grid"><thead><tr><th style="width:15%">Other domain</th><th style="width:13%">Direction</th><th style="width:30%">What it means</th><th style="width:10%">Type</th><th style="width:11%">SID filtering</th><th style="width:8%">Sign-in scope</th><th style="width:13%">Covered with this report?</th></tr></thead><tbody>'
+        foreach ($t in $stTrusts) {
+            $sf = if ($t.SidRisk) { ("<span class='badge bad'>{0}</span>" -f (HtmlEnc $t.SidFilter)) } else { (HtmlEnc $t.SidFilter) }
+            $au = if ($t.TrustsOut -and -not $t.WithinForest -and -not $t.Selective) { ("{0}<div class='mut' style='font-size:11px'>any account there can be granted access here</div>" -f (HtmlEnc $t.Auth)) } else { (HtmlEnc $t.Auth) }
+            $extra = ''
+            if ($t.TrustAccount) { $extra += ("<div class='mut' style='font-size:11px'>Trust account in this domain: <span class='mono'>{0}</span></div>" -f (HtmlEnc $t.TrustAccount)) }
+            if ($t.Created)      { $extra += ("<div class='mut' style='font-size:11px'>Created {0}{1}</div>" -f (HtmlEnc $t.Created), $(if ($t.Changed -and $t.Changed -ne $t.Created) { ', changed ' + (HtmlEnc $t.Changed) } else { '' })) }
+            A ("<tr><td><b>{0}</b><div class='mut' style='font-size:11px'>{1}</div>{2}</td><td>{3}</td><td style='font-size:12px'>{4}</td><td>{5}<div class='mut' style='font-size:11px'>{6}</div></td><td>{7}</td><td>{8}</td><td>{9}</td></tr>" -f `
+                (HtmlEnc $t.Partner), (HtmlEnc $t.Flat), $extra,
+                (HtmlEnc $t.Direction), (HtmlEnc $t.Meaning),
+                (HtmlEnc $t.Kind), (HtmlEnc ('Passes on to further domains: ' + $t.Transitive)),
+                $sf, $au, (Get-CompareStateHtml $t.Partner))
+        }
+        A '</tbody></table>'
+        if (@($stTrusts | Where-Object { $_.SidRisk }).Count -gt 0) {
+            A '<div class="missing" style="margin-left:0;margin-top:8px">SID filtering is off or relaxed on a trust where this domain is the one doing the trusting. An administrator of the other domain can then present credentials that carry this domain&rsquo;s privileged group identities. Turn SID filtering back on unless a migration that needs SID history is in progress, and record the end date if one is.</div>'
+        }
+    }
+
+    # ---- what does and does not cross the boundary
+    if ($connNames.Count -gt 0) {
+        A '<h2>What crosses the domain boundary, and what does not</h2>'
+        A '<div class="area">'
+        A '<div class="hint" style="margin-left:0"><b>Does not cross:</b> Group Policy Objects, the password and lockout policy, fine-grained password policies, and every setting in the focus areas of this report. A GPO linked in a parent domain is not inherited by a child domain. Each domain has to be configured, and reviewed, on its own.</div>'
+        A '<div class="hint" style="margin-left:0"><b>Does cross:</b> sign-ins, in the direction each trust allows. An account from a trusted domain can be placed in a group here or given rights to a server or share here, and it arrives under its home domain&rsquo;s password rules, not this domain&rsquo;s.</div>'
+        if ($domStruct.Parent -or $domStruct.Position -eq 'Tree root') {
+            A ("<div class='missing' style='margin-left:0;font-weight:400'><b>Administrators above this domain.</b> The Enterprise Admins and Schema Admins groups live in the forest root, <b>{0}</b>, and their members hold administrative rights over this domain. They are not listed in this report&rsquo;s privileged groups because they belong to the other domain. Review that membership in the scan of {0}.</div>" -f (HtmlEnc $domStruct.ForestRoot))
+        }
+        if ($domStruct.Position -eq 'Forest root' -and $stOthers.Count -gt 0) {
+            A ("<div class='missing' style='margin-left:0;font-weight:400'><b>This domain administers the others.</b> Members of Enterprise Admins and Schema Admins here hold administrative rights over every other domain in the forest ({0}). A weakness in this domain&rsquo;s privileged accounts is a weakness in all of them.</div>" -f (HtmlEnc (($stOthers | ForEach-Object { $_.Dns }) -join ', ')))
+        }
+        if ($stOthers.Count -gt 0) {
+            A '<div class="hint" style="margin-left:0"><b>One exception for Group Policy:</b> a GPO linked to an Active Directory <i>site</i>, rather than to a domain or OU, applies to every computer in that site whichever domain it belongs to. Site-linked GPOs are rare; check the Scope index for any link that is a site name rather than a domain path.</div>'
+        }
+        A '</div>'
+    }
+
+    # ---- accounts from elsewhere holding privilege here
+    A '<h2>Accounts from other domains with privilege here</h2>'
+    if (@($foreignPriv).Count -eq 0) {
+        A '<div class="verified">None. Every direct member of the privileged groups in this domain is an account or group that lives in this domain.</div>'
+    }
+    else {
+        A ("<div class='missing' style='margin-left:0'>{0} member(s) of this domain&rsquo;s privileged groups are accounts that live in another domain. They administer this domain but are created, disabled and password-managed somewhere else, under that domain&rsquo;s rules.</div>" -f @($foreignPriv).Count)
+        A '<table class="grid"><thead><tr><th>Privileged group</th><th>Member</th><th>Where it comes from</th><th>SID</th></tr></thead><tbody>'
+        foreach ($fp in @($foreignPriv)) {
+            A ("<tr><td>{0}</td><td class='mono'>{1}</td><td>{2}</td><td class='mono' style='font-size:11px'>{3}</td></tr>" -f `
+                (HtmlEnc $fp.Group), (HtmlEnc $fp.Member), (HtmlEnc $fp.Origin), (HtmlEnc $fp.Sid))
+        }
+        A '</tbody></table>'
+    }
+
+    if (@($otherDomains.SidHistory).Count -gt 0) {
+        A '<h2>Accounts carrying SID history</h2>'
+        A '<div class="sub">SID history is written when an account is migrated from one domain to another, so that it keeps its old access. It should be cleared once the migration is finished; left in place it is standing access tied to a domain that may no longer be managed.</div>'
+        A '<table class="grid"><thead><tr><th>Migrated from</th><th>Accounts</th><th>Examples</th><th>Domain SID</th></tr></thead><tbody>'
+        foreach ($sh in @($otherDomains.SidHistory)) {
+            A ("<tr><td>{0}</td><td>{1}</td><td class='mono'>{2}</td><td class='mono' style='font-size:11px'>{3}</td></tr>" -f `
+                (HtmlEnc $sh.Domain), $sh.Count, (HtmlEnc $sh.Examples), (HtmlEnc $sh.DomainSid))
+        }
+        A '</tbody></table>'
+    }
+
+    # ---- evidence of domains that are not connected at all
+    A '<h2>Other domains: indicators</h2>'
+    A '<div class="sub">A domain with no trust and no forest relationship cannot be listed by Active Directory, because nothing records it. These are the places this domain would carry evidence of one: computers registered under another DNS name, sign-in name suffixes, network paths written into Group Policy, DNS forwarders, SID history, and leftover group member references. Each name is then checked with one DNS lookup for that domain&rsquo;s domain controllers.</div>'
+    if (-not $otherDomains.Checked) {
+        A '<div class="missing" style="margin-left:0">NOT CHECKED &ndash; the indicator search did not complete. See the console output from this run.</div>'
+    }
+    elseif (@($otherDomains.Rows).Count -eq 0) {
+        A '<div class="verified">No indicators of another Active Directory domain were found in the places checked. This is not proof that none exists: a domain on a separate network that nothing here refers to leaves no trace in this one.</div>'
+    }
+    else {
+        A '<table class="grid"><thead><tr><th style="width:22%">Name</th><th style="width:46%">Evidence</th><th style="width:14%">Answers in DNS as an AD domain?</th><th style="width:18%">Domain controllers named</th></tr></thead><tbody>'
+        foreach ($od in @($otherDomains.Rows)) {
+            $lv = switch ("$($od.Live)") {
+                'Yes'   { "<span class='badge bad'>Yes &ndash; live domain</span>" }
+                'No'    { "<span class='badge'>No</span>" }
+                default { (HtmlEnc $od.Live) }
+            }
+            $ev = ''
+            foreach ($e in @($od.Evidence)) { $ev += ("<div>{0}</div>" -f (HtmlEnc $e)) }
+            A ("<tr><td class='mono'><b>{0}</b></td><td style='font-size:12px'>{1}</td><td>{2}</td><td class='mono' style='font-size:11px'>{3}</td></tr>" -f `
+                (HtmlEnc $od.Name), $ev, $lv, (HtmlEnc $od.Dcs))
+        }
+        A '</tbody></table>'
+        if ($stLive.Count -gt 0) {
+            A ("<div class='missing' style='margin-left:0;margin-top:8px'>{0} name(s) above answer as a live Active Directory domain that this domain has no trust or forest relationship with. Establish who owns each one and whether the organization&rsquo;s staff or computers use it, and scan it.</div>" -f $stLive.Count)
+        }
+    }
+    foreach ($n in @($otherDomains.Notes)) {
+        A ("<div class='note' style='margin-left:0'>{0}</div>" -f (HtmlEnc $n))
+    }
+    if ($otherDomains.ProbeText) {
+        A ("<div class='sub' style='margin-top:8px'>{0}</div>" -f (HtmlEnc $otherDomains.ProbeText))
+    }
+}
+A '</section>'
+
+# ============================================ VIEW: DOMAIN COMPARISON ======
+if ($true) {
+    A '<section class="view" id="view-compare">'
+    A '<h1>Domain comparison</h1>'
+    if (@($domCompare).Count -eq 0) {
+        if ($SkipDomainStructure) {
+            A '<div class="missing" style="margin-left:0">NOT CHECKED &ndash; the report was run with -SkipDomainStructure.</div>'
+        }
+        elseif (-not $domStruct.Checked) {
+            A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; {0}</div>" -f (HtmlEnc $domStruct.Error))
+        }
+        else {
+            A '<div class="verified">Nothing to compare. This domain has no other domain in its forest and no trusts, and no scan of another domain was supplied.</div>'
+        }
+        A '<h2>Comparing with a domain that is not connected</h2>'
+        A '<div class="area">'
+        A '<div class="hint" style="margin-left:0">This page lists the accounts that exist in two domains, the computers that exist in two domains, which domain each workstation and server is really joined to, and the password and lockout policy of the two side by side. It fills in by itself for any domain joined to this one by a forest or a trust.</div>'
+        A '<div class="hint" style="margin-left:0">For a domain with no such connection, run this same script in that domain, then run it here again and name the other scan:</div>'
+        A '<pre class="snippet">.\Export-ADAuditReport.ps1 -CompareSnapshot "C:\path\to\AD-Report-other.domain-YYYYMMDD\ad-snapshot.json"</pre>'
+        A '<div class="hint" style="margin-left:0">Copying the other domain&rsquo;s whole report folder into this report&rsquo;s output folder does the same thing without the switch.</div>'
+        A '</div>'
+    }
+    A ("<div class='sub'><b>{0}</b> set against each domain it is connected to. Two things matter here. A person with an account in both domains has two passwords under two sets of rules, and the weaker domain is the easier place to learn a password that is often the same in the other. A computer with an account in both was moved from one to the other, or rebuilt, and the account left behind is a stale object that still exists.</div>" -f (HtmlEnc $domStruct.ThisDns))
+
+    $ci = 0
+    foreach ($dc in @($domCompare)) {
+        $ci++
+        A ("<h2>{0} <span class='badge'>{1}</span></h2>" -f (HtmlEnc $dc.Domain), (HtmlEnc $dc.Relationship))
+
+        if (-not $dc.Ok) {
+            A ("<div class='missing' style='margin-left:0'>NOT COMPARED &ndash; {0}</div>" -f (HtmlEnc $dc.Error))
+            continue
+        }
+
+        A ("<div class='sub'>Source for {0}: {1}, as of {2}.</div>" -f (HtmlEnc $dc.Domain), (HtmlEnc $dc.Source), (HtmlEnc $dc.When))
+
+        $dupU    = @($dc.DupUsers)
+        $dupC    = @($dc.DupComputers)
+        $dupUOn  = @($dupU | Where-Object { $_.BothEnabled })
+        $safeDom = ($dc.Domain -replace '[^\w\.\-]', '_')
+
+        A '<div class="stats">'
+        A ("<div class='stat'><b>{0}</b><span>Accounts here</span></div>" -f $dc.UsersHere)
+        A ("<div class='stat'><b>{0}</b><span>Accounts in {1}</span></div>" -f $dc.UsersThere, (HtmlEnc $dc.Domain))
+        A ("<div class='stat'><b style='color:{1}'>{0}</b><span>Accounts in both</span></div>" -f $dupU.Count, $(if ($dupU.Count -gt 0) { 'var(--bad)' } else { 'var(--ok)' }))
+        A ("<div class='stat'><b>{0}</b><span>Enabled in both</span></div>" -f $dupUOn.Count)
+        A ("<div class='stat'><b>{0}</b><span>Computers here</span></div>" -f $dc.CompsHere)
+        A ("<div class='stat'><b>{0}</b><span>Computers in {1}</span></div>" -f $dc.CompsThere, (HtmlEnc $dc.Domain))
+        A ("<div class='stat'><b style='color:{1}'>{0}</b><span>Computers in both</span></div>" -f $dupC.Count, $(if ($dupC.Count -gt 0) { 'var(--bad)' } else { 'var(--ok)' }))
+        A ("<div class='stat'><b style='color:{1}'>{0}</b><span>Policy differences</span></div>" -f $dc.PolicyDiff, $(if ($dc.PolicyDiff -gt 0) { 'var(--bad)' } else { 'var(--ok)' }))
+        A '</div>'
+
+        # ---- which domain the machines are joined to
+        A '<h3 style="margin:18px 0 6px;font-size:14px">Where computers are joined</h3>'
+        A ("<table class='grid'><thead><tr><th>Enabled computer accounts</th><th>{0}</th><th>{1}</th></tr></thead><tbody>" -f (HtmlEnc $domStruct.ThisDns), (HtmlEnc $dc.Domain))
+        A ("<tr><td><b>Workstations</b><div class='mut' style='font-size:11px'>operating system is not a server edition</div></td><td>{0}</td><td>{1}</td></tr>" -f $dc.WksHere, $dc.WksThere)
+        A ("<tr><td><b>Servers</b></td><td>{0}</td><td>{1}</td></tr>" -f $dc.SrvHere, $dc.SrvThere)
+        A '</tbody></table>'
+        if ($dc.WksHere -gt 0 -and $dc.WksThere -gt 0) {
+            A ("<div class='missing' style='margin-left:0;margin-top:8px'>Workstations are joined to both domains: {0} here and {1} in {2}. A workstation takes its Group Policy, password rules and lockout rules from whichever domain it was joined to, so the same organization&rsquo;s PCs are running under two different sets of controls. Decide which domain workstations belong in and document it.</div>" -f `
+                $dc.WksHere, $dc.WksThere, (HtmlEnc $dc.Domain))
+        }
+
+        # ---- policy side by side
+        A '<h3 style="margin:18px 0 6px;font-size:14px">Password and lockout policy, side by side</h3>'
+        A ("<table class='grid'><thead><tr><th>Setting</th><th>{0}</th><th>{1}</th><th>Result</th></tr></thead><tbody>" -f (HtmlEnc $domStruct.ThisDns), (HtmlEnc $dc.Domain))
+        foreach ($pr in @($dc.Policy)) {
+            $st = switch ("$($pr.State)") {
+                'Same'      { "<span class='badge ok'>Same</span>" }
+                'Different' { "<span class='badge bad'>Different</span>" }
+                default     { "<span class='badge'>Cannot compare</span>" }
+            }
+            A ("<tr><td><b>{0}</b></td><td>{1}</td><td>{2}</td><td>{3}</td></tr>" -f (HtmlEnc $pr.Setting), (HtmlEnc $pr.Here), (HtmlEnc $pr.There), $st)
+        }
+        A '</tbody></table>'
+        if ($dc.PolicyDiff -gt 0) {
+            A '<div class="missing" style="margin-left:0;margin-top:8px">The two domains hold their accounts to different standards. Where the same people use both, the weaker policy sets the real level of protection.</div>'
+        }
+
+        # ---- every account across both domains
+        A '<h3 style="margin:22px 0 6px;font-size:14px">Accounts across both domains</h3>'
+        $allU  = @($dc.AllUsers)
+        $uHere = @($allU | Where-Object { $_.Where -eq 'Here' })
+        $uThere = @($allU | Where-Object { $_.Where -eq 'There' })
+        if ($dupU.Count -eq 0) {
+            A '<div class="verified">No account name exists in both domains. Built-in accounts such as Administrator, Guest and krbtgt are left out, because every domain has them.</div>'
+        }
+        else {
+            A ("<div class='missing' style='margin-left:0'>{0} sign-in name(s) exist in both domains, {1} of them enabled in both. Each is one person holding two accounts with two passwords under two sets of rules. Matching is by sign-in name, so confirm each pair is the same person before acting on it.</div>" -f $dupU.Count, $dupUOn.Count)
+        }
+        A '<div class="stats">'
+        A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter. The list opens on the accounts that exist in both domains.</div>'
+        foreach ($t in @(
+                @{ N = $dupU.Count;   L = 'In both domains';                          A = 'where'; V = 'both';  O = $true },
+                @{ N = $uHere.Count;  L = ('Only in {0}' -f (HtmlEnc $domStruct.ThisDns)); A = 'where'; V = 'here';  O = $false },
+                @{ N = $uThere.Count; L = ('Only in {0}' -f (HtmlEnc $dc.Domain));    A = 'where'; V = 'there'; O = $false },
+                @{ N = $allU.Count;   L = 'Every account';                            A = '';      V = '';      O = $false })) {
+            A ("<div class='stat statt{5}' data-target='#tbl-cmpu-{6}' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+                $t['N'], $t['L'], $t['A'], $t['V'], '', $(if ($t['O']) { ' on' } else { '' }), $ci)
+        }
+        A '</div>'
+        A ("<div class='tblbar'><input class='tblq' type='search' data-target='#tbl-cmpu-{0}' data-count='cnt-cmpu-{0}' placeholder='Filter by account or name...'>" -f $ci)
+        A ("<label style='color:var(--mut);display:flex;gap:6px;align-items:center;cursor:pointer'><input type='checkbox' class='tblf' data-filter-target='#tbl-cmpu-{0}' data-attr='both' data-val='1'> Enabled in both</label>" -f $ci)
+        A ("<label style='color:var(--mut);display:flex;gap:6px;align-items:center;cursor:pointer'><input type='checkbox' class='tblf' data-filter-target='#tbl-cmpu-{0}' data-attr='priv' data-val='1'> Privileged here</label>" -f $ci)
+        A ("<span class='sub'><b id='cnt-cmpu-{0}'>{1}</b> shown</span>" -f $ci, $dupU.Count)
+        A ("<button type='button' class='btnCsv noprint' data-table='tbl-cmpu-{0}' data-file='AccountsAcrossDomains-{1}-{2}.csv'>Export this view to CSV</button>" -f `
+            $ci, $safeDom, (Get-Date -Format 'yyyyMMdd'))
+        A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
+        A ("<table class='tbl' id='tbl-cmpu-{0}'><tr><th>Account</th><th>Name</th><th>Found in</th><th>State in {1}</th><th>State in {2}</th><th>Privileged in {1}</th></tr>" -f `
+            $ci, (HtmlEnc $domStruct.ThisDns), (HtmlEnc $dc.Domain))
+        foreach ($du in $allU) {
+            $k = (@($du.Sam, $du.Name, $du.Privileged, $du.Where) -join ' ')
+            $found = switch ($du.Where) {
+                'Both'  { '<span class="badge bad">Both domains</span>' }
+                'Here'  { (HtmlEnc $domStruct.ThisDns) }
+                default { (HtmlEnc $dc.Domain) }
+            }
+            $stH = if ($null -eq $du.EnabledHere)  { '<span class="mut">&ndash;</span>' } elseif ($du.EnabledHere)  { 'Enabled' } else { '<span class="badge">Disabled</span>' }
+            $stT = if ($null -eq $du.EnabledThere) { '<span class="mut">&ndash;</span>' } elseif ($du.EnabledThere) { 'Enabled' } else { '<span class="badge">Disabled</span>' }
+            A ("<tr class='row' data-k='{0}' data-where='{1}' data-both='{2}' data-priv='{3}'><td class='mono'>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td></tr>" -f `
+                (HtmlEnc $k), "$($du.Where)".ToLower(),
+                $(if ($du.EnabledHere -and $du.EnabledThere) { '1' } else { '0' }),
+                $(if ($du.Privileged) { '1' } else { '0' }),
+                (HtmlEnc $du.Sam), (HtmlEnc $du.Name), $found, $stH, $stT,
+                $(if ($du.Privileged) { ("<span class='badge bad'>{0}</span>" -f (HtmlEnc $du.Privileged)) } else { '' }))
+        }
+        A '</table>'
+
+        # ---- every computer across both domains
+        A '<h3 style="margin:26px 0 6px;font-size:14px">Computers across both domains</h3>'
+        $allC   = @($dc.AllComputers)
+        $cHere  = @($allC | Where-Object { $_.Where -eq 'Here' })
+        $cThere = @($allC | Where-Object { $_.Where -eq 'There' })
+        $cWks   = @($allC | Where-Object { -not $_.IsServer })
+        $cSrv   = @($allC | Where-Object { $_.IsServer })
+        if ($dupC.Count -eq 0) {
+            A '<div class="verified">No computer name exists in both domains.</div>'
+        }
+        else {
+            A ("<div class='missing' style='margin-left:0'>{0} computer name(s) exist in both domains. A computer is joined to one domain at a time, so one account of each pair is a leftover. The more recent check-in shows which domain the machine is really joined to.</div>" -f $dupC.Count)
+        }
+        A '<div class="stats">'
+        A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter. The first row filters by domain, the second by role, and the two combine. Choose Every computer to see which domain each machine is joined to.</div>'
+        foreach ($t in @(
+                @{ N = $dupC.Count;   L = 'In both domains';                          A = 'where'; V = 'both';  O = ($dupC.Count -gt 0) },
+                @{ N = $cHere.Count;  L = ('Only in {0}' -f (HtmlEnc $domStruct.ThisDns)); A = 'where'; V = 'here';  O = $false },
+                @{ N = $cThere.Count; L = ('Only in {0}' -f (HtmlEnc $dc.Domain));    A = 'where'; V = 'there'; O = $false },
+                @{ N = $allC.Count;   L = 'Every computer';                           A = '';      V = '';      O = ($dupC.Count -eq 0) })) {
+            A ("<div class='stat statt{5}' data-target='#tbl-cmpc-{6}' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+                $t['N'], $t['L'], $t['A'], $t['V'], '', $(if ($t['O']) { ' on' } else { '' }), $ci)
+        }
+        A '</div>'
+        A '<div class="stats" style="margin-top:-6px">'
+        foreach ($t in @(
+                @{ N = $allC.Count; L = 'Workstations and servers'; A = '';    V = '';  O = $true },
+                @{ N = $cWks.Count; L = 'Workstations';             A = 'srv'; V = '0'; O = $false },
+                @{ N = $cSrv.Count; L = 'Servers';                  A = 'srv'; V = '1'; O = $false })) {
+            A ("<div class='stat statt{4}' data-target='#tbl-cmpc-{5}' data-slot='2' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+                $t['N'], $t['L'], $t['A'], $t['V'], $(if ($t['O']) { ' on' } else { '' }), $ci)
+        }
+        A '</div>'
+        A ("<div class='tblbar'><input class='tblq' type='search' data-target='#tbl-cmpc-{0}' data-count='cnt-cmpc-{0}' placeholder='Filter by computer or operating system...'>" -f $ci)
+        A ("<span class='sub'><b id='cnt-cmpc-{0}'>{1}</b> shown</span>" -f $ci, $(if ($dupC.Count -gt 0) { $dupC.Count } else { $allC.Count }))
+        A ("<button type='button' class='btnCsv noprint' data-table='tbl-cmpc-{0}' data-file='ComputersAcrossDomains-{1}-{2}.csv'>Export this view to CSV</button>" -f `
+            $ci, $safeDom, (Get-Date -Format 'yyyyMMdd'))
+        A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
+        A ("<table class='tbl' id='tbl-cmpc-{0}'><tr><th>Computer</th><th>Found in</th><th>Role</th><th>Operating system</th><th>State in {1}</th><th>Last check-in in {1}</th><th>State in {2}</th><th>Last check-in in {2}</th><th>Joined to</th></tr>" -f `
+            $ci, (HtmlEnc $domStruct.ThisDns), (HtmlEnc $dc.Domain))
+        foreach ($dx in $allC) {
+            $k = (@($dx.Name, $dx.OS, $dx.JoinedTo, $dx.Where) -join ' ')
+            $found = switch ($dx.Where) {
+                'Both'  { '<span class="badge bad">Both domains</span>' }
+                'Here'  { (HtmlEnc $domStruct.ThisDns) }
+                default { (HtmlEnc $dc.Domain) }
+            }
+            $stH = if ($null -eq $dx.EnabledHere)  { '<span class="mut">&ndash;</span>' } elseif ($dx.EnabledHere)  { '<span class="badge ok">Enabled</span>' } else { '<span class="badge">Disabled</span>' }
+            $stT = if ($null -eq $dx.EnabledThere) { '<span class="mut">&ndash;</span>' } elseif ($dx.EnabledThere) { '<span class="badge ok">Enabled</span>' } else { '<span class="badge">Disabled</span>' }
+            A ("<tr class='row' data-k='{0}' data-where='{1}' data-srv='{2}'><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td data-s='{8}'>{9}</td><td>{10}</td><td data-s='{11}'>{12}</td><td>{13}</td></tr>" -f `
+                (HtmlEnc $k), "$($dx.Where)".ToLower(), $(if ($dx.IsServer) { '1' } else { '0' }),
+                (HtmlEnc $dx.Name), $found, $(if ($dx.IsServer) { 'Server' } else { 'Workstation' }), (HtmlEnc $dx.OS),
+                $stH, $(if ($dx.LastHere) { $dx.LastHere } else { '1000-01-01' }), $(if ($dx.LastHere) { (HtmlEnc $dx.LastHere) } else { '<span class="mut">&ndash;</span>' }),
+                $stT, $(if ($dx.LastThere) { $dx.LastThere } else { '1000-01-01' }), $(if ($dx.LastThere) { (HtmlEnc $dx.LastThere) } else { '<span class="mut">&ndash;</span>' }),
+                (HtmlEnc $dx.JoinedTo))
+        }
+        A '</table>'
+    }
+    A '</section>'
+}
+
+# ============================================ VIEW: ENTRA ID AND INTUNE ====
+A '<section class="view" id="view-entra">'
+A '<h1>Entra ID and Intune</h1>'
+A '<div class="sub">What this domain&rsquo;s own directory shows about its connection to Microsoft Entra ID and Intune. Active Directory holds the footprints of that connection: the sync account, the hybrid-join pointer, the single sign-on account, the device certificates and the enrollment policy. It does not hold the cloud side. Whether each sync cycle succeeds, which devices Entra ID has registered, and which Intune policies are assigned are all kept in the Microsoft 365 tenant and are not read here.</div>'
+A '<div style="height:14px"></div>'
+
+if (-not $entra.Checked) {
+    A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; {0}</div>" -f (HtmlEnc $entra.Error))
+}
+else {
+    A '<div class="stats">'
+    A ("<div class='stat'><b>{0}</b><span>Sync installations found</span></div>" -f (@($entra.SyncAccounts).Count + @($entra.CloudSyncAgents).Count))
+    A ("<div class='stat'><b>{0}</b><span>Accounts with the sync anchor</span></div>" -f $(if ($null -ne $entra.SyncedUsers) { $entra.SyncedUsers } else { '&ndash;' }))
+    A ("<div class='stat'><b>{0}</b><span>Computers with a device certificate</span></div>" -f $(if ($null -ne $entra.HybridComputers) { $entra.HybridComputers } else { '&ndash;' }))
+    A ("<div class='stat'><b style='font-size:15px;line-height:26px'>{0}</b><span>Hybrid join pointer</span></div>" -f $(if ($entra.Scp.Present) { 'Present' } elseif ($entra.Scp.Checked) { 'Absent' } else { 'Not checked' }))
+    A ("<div class='stat'><b style='font-size:15px;line-height:26px'>{0}</b><span>Intune auto-enrollment GPO</span></div>" -f (HtmlEnc $entra.EnrollState))
+    A '</div>'
+
+    A '<table class="grid"><thead><tr><th style="width:27%">Question</th><th style="width:17%">Answer</th><th>Evidence in Active Directory</th></tr></thead><tbody>'
+    foreach ($er in @($entraRows)) {
+        $ans = if ($er.Tone) { ("<span class='badge {0}'>{1}</span>" -f $er.Tone, (HtmlEnc $er.Answer)) } else { ("<span class='badge'>{0}</span>" -f (HtmlEnc $er.Answer)) }
+        A ("<tr><td><b>{0}</b></td><td>{1}</td><td style='font-size:12px'>{2}</td></tr>" -f (HtmlEnc $er.Question), $ans, (HtmlEnc $er.Evidence))
+    }
+    A '</tbody></table>'
+
+    if (@($entra.SyncAccounts).Count -gt 0) {
+        A '<h2>Sync installations</h2>'
+        A '<div class="sub">Each Entra Connect Sync installation creates one account in the domain and records, in its description, the server it runs on and the tenant it feeds. The account holds directory replication rights, which makes it as sensitive as a domain administrator.</div>'
+        A '<table class="grid"><thead><tr><th>Account</th><th>Sync server</th><th>Tenant</th><th>State</th><th>Last sign-in</th><th>Password last set</th></tr></thead><tbody>'
+        foreach ($sa in @($entra.SyncAccounts)) {
+            A ("<tr><td class='mono'>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td></tr>" -f `
+                (HtmlEnc $sa.Sam),
+                $(if ($sa.Server) { (HtmlEnc $sa.Server) } else { '<span class="mut">not recorded</span>' }),
+                $(if ($sa.Tenant) { (HtmlEnc $sa.Tenant) } else { '<span class="mut">not recorded</span>' }),
+                $(if ($sa.Enabled) { 'Enabled' } else { '<span class="badge">Disabled</span>' }),
+                $(if ($null -eq $sa.DaysIdle) { '<span class="badge bad">never</span>' }
+                  elseif ($sa.DaysIdle -gt 30) { ("{0:yyyy-MM-dd} <span class='badge bad'>{1} days ago</span>" -f $sa.LastLogon, $sa.DaysIdle) }
+                  else { ("{0:yyyy-MM-dd}" -f $sa.LastLogon) }),
+                $(if ($sa.PwdLastSet) { ("{0:yyyy-MM-dd}" -f $sa.PwdLastSet) } else { '<span class="mut">&ndash;</span>' }))
+        }
+        A '</tbody></table>'
+    }
+
+    $entraGpo = @(@($entra.JoinGpo) + @($entra.EnrollGpo))
+    A '<h2>Group Policy settings for device registration and enrollment</h2>'
+    if ($entraGpo.Count -eq 0) {
+        A '<div class="missing" style="margin-left:0">No GPO in this domain registers computers as devices or switches on Intune automatic enrollment.</div>'
+    }
+    else {
+        A '<table class="grid"><thead><tr><th>Purpose</th><th>Group Policy Object</th><th>Applying?</th><th>Linked to</th><th>Setting</th><th>Value</th></tr></thead><tbody>'
+        foreach ($eg in $entraGpo) {
+            A ("<tr><td>{0}</td><td><a href='#' onclick=""return gotoGpo('{1}')"">{2}</a></td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td></tr>" -f `
+                $(if ($eg.What -eq 'Enroll') { 'Intune enrollment' } else { 'Device registration' }),
+                $eg.Anchor, (HtmlEnc $eg.Gpo),
+                $(if ($eg.Applying) { '<span class="badge ok">Yes</span>' } else { '<span class="badge bad">No</span>' }),
+                $(if ($eg.LinkPaths) { (HtmlEnc $eg.LinkPaths) } else { '<span class="mut">not linked</span>' }),
+                (HtmlEnc $eg.Name), (HtmlEnc $eg.Value))
+        }
+        A '</tbody></table>'
+    }
+
+    A '<h2>What this page cannot tell you</h2>'
+    A '<div class="area">'
+    A '<div class="hint" style="margin-left:0">Active Directory does not record whether the sync is healthy, which accounts and devices exist in Entra ID, whether a device finished hybrid join, whether it is enrolled in Intune, or which compliance and configuration policies are assigned to it. A domain can show every footprint on this page and still have no Intune policy reaching a single device.</div>'
+    A '<div class="hint" style="margin-left:0">To answer those, read the tenant: the Entra admin center for sync health and device registration, and the Intune admin center for enrollment, policy assignment and compliance.</div>'
+    A '</div>'
+}
 A '</section>'
 
 # ==================================================== VIEW: PRIVILEGED =====
@@ -3993,6 +6345,10 @@ A '<section class="view" id="view-priv">'
 A '<h1>Privileged group membership</h1>'
 if ($privGroups.Count -gt 0) {
     A '<div class="sub">Effective membership, including users inherited through nested groups. Disabled accounts, non-expiring passwords and stale logons are flagged.</div>'
+    if (@($foreignPriv).Count -gt 0) {
+        A ("<div class='missing' style='margin-left:0;margin-top:10px'>{0} member(s) of these groups are accounts from ANOTHER domain: {1}. They are managed under that domain&rsquo;s rules, not this one&rsquo;s. See <a href='#' onclick=""show('structure');return false"">Forest &amp; trusts</a>.</div>" -f `
+            @($foreignPriv).Count, (HtmlEnc ((@($foreignPriv | ForEach-Object { '{0} in {1}' -f $_.Member, $_.Group }) | Select-Object -First 6) -join '; ')))
+    }
     A '<div class="tblbar">'
     A ("<button type='button' class='btnCsv noprint' data-cards='priv-all' data-file='PrivilegedGroups-{0}-{1}.csv'>Export this view to CSV</button>" -f `
         ($Domain -replace '[^\w\.\-]', '_'), (Get-Date -Format 'yyyyMMdd'))
@@ -4252,6 +6608,14 @@ else {
         $nameCell = (HtmlEnc $r.Name)
         if ($r.PwdNever) { $nameCell += ' <span class="badge warn">Password never expires</span>' }
         if ($r.Spns -gt 0) { $nameCell += (' <span class="badge">SPN &times;{0}</span>' -f $r.Spns) }
+        $samLow = "$($r.Sam)".ToLower()
+        if ($script:TrustAccounts.ContainsKey($samLow)) {
+            # not a person: the account a trust uses, named after the domain that trusts this one
+            $nameCell += (' <span class="badge bad">Trust account for {0}</span>' -f (HtmlEnc $script:TrustAccounts[$samLow]))
+        }
+        elseif ($samLow.EndsWith('$')) {
+            $nameCell += ' <span class="badge warn">Trust or machine-style account</span>'
+        }
         A ("<tr class='invrow' data-k='{0}' data-en='{1}' data-priv='{2}' data-never='{3}' data-pne='{4}'><td class='mono'>{5}</td><td>{6}</td><td>{7}</td><td data-s='{8}'>{9}</td>{10}{11}{12}<td class='days' data-s='{13}'>{14}</td>{15}{16}<td class='mono'>{17}</td><td>{18}</td></tr>" -f `
             (HtmlEnc $k), `
             $(if ($r.Enabled) { '1' } else { '0' }), `
@@ -4267,6 +6631,77 @@ else {
             (HtmlEnc $r.OU), (HtmlEnc $r.Description))
     }
     A '</table>'
+}
+A '</section>'
+
+# ================================================ VIEW: ALL COMPUTERS ======
+A '<section class="view" id="view-allcomputers">'
+A '<h1>All computer accounts</h1>'
+if (-not $compInv.Checked) {
+    A ("<div class='missing' style='margin-left:0'>NOT CHECKED &ndash; {0}</div>" -f (HtmlEnc $compInv.Error))
+}
+else {
+    $ciAll   = @($compInv.Rows)
+    $ciEn    = @($ciAll | Where-Object { $_.Enabled })
+    $ciDis   = @($ciAll | Where-Object { -not $_.Enabled })
+    $ciSrv   = @($ciAll | Where-Object { $_.IsServer })
+    $ciWks   = @($ciAll | Where-Object { -not $_.IsServer })
+    $ciDc    = @($ciAll | Where-Object { $_.IsDc })
+    $ciNever = @($ciAll | Where-Object { -not $_.LastLogon })
+    $ciDup   = @($ciAll | Where-Object { $_.InOther })
+
+    A ("<div class='sub'>Every computer account in {0}, as read from the directory on {1}: workstations, servers and domain controllers. This is the list that answers which machines are joined to this domain. The Cleanup view lists only the ones that have stopped checking in. The same list is in AllComputers.csv in this folder.</div>" -f `
+        (HtmlEnc $Domain), (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+
+    A '<div class="stats">'
+    A '<div class="sub noprint" style="flex-basis:100%;margin:0 0 -4px">Click a tile to filter the list below.</div>'
+    $ciTiles = @(
+        @{ N = $ciAll.Count;   L = 'Computer accounts';  A = '';      V = '';  O = $true },
+        @{ N = $ciEn.Count;    L = 'Enabled';            A = 'en';    V = '1'; O = $false },
+        @{ N = $ciDis.Count;   L = 'Disabled';           A = 'en';    V = '0'; O = $false },
+        @{ N = $ciWks.Count;   L = 'Workstations';       A = 'srv';   V = '0'; O = $false },
+        @{ N = $ciSrv.Count;   L = 'Servers';            A = 'srv';   V = '1'; O = $false },
+        @{ N = $ciDc.Count;    L = 'Domain controllers'; A = 'dc';    V = '1'; O = $false },
+        @{ N = $ciNever.Count; L = 'Never checked in';   A = 'never'; V = '1'; O = $false }
+    )
+    if (@($domCompare | Where-Object { $_.Ok }).Count -gt 0) {
+        $ciTiles += @{ N = $ciDup.Count; L = 'Also in another domain'; A = 'dup'; V = '1'; O = $false }
+    }
+    foreach ($t in $ciTiles) {
+        A ("<div class='stat statt{5}' data-target='#tbl-comp' data-attr='{2}' data-val='{3}' role='button' tabindex='0'><b>{0}</b><span>{1}</span></div>" -f `
+            $t['N'], $t['L'], $t['A'], $t['V'], '', $(if ($t['O']) { ' on' } else { '' }))
+    }
+    A '</div>'
+
+    A '<div class="tblbar"><input class="tblq" type="search" data-target="#tbl-comp" data-count="cnt-comp" placeholder="Filter by name, operating system, OU or description...">'
+    A ("<span class='sub'><b id='cnt-comp'>{0}</b> shown</span>" -f $ciAll.Count)
+    A ("<button type='button' class='btnCsv noprint' data-table='tbl-comp' data-file='AllComputers-{0}-{1}.csv'>Export this view to CSV</button>" -f `
+        ($Domain -replace '[^\w\.\-]', '_'), (Get-Date -Format 'yyyyMMdd'))
+    A '<button type="button" class="btnPrint noprint">Print this view</button></div>'
+
+    if ($ciAll.Count -eq 0) { A '<div class="sub">No computer accounts were returned.</div>' }
+    else {
+        A '<table class="tbl" id="tbl-comp"><tr><th>Computer</th><th>Operating system</th><th>Role</th><th>State</th><th>Last check-in</th><th>Idle</th><th>Machine password set</th><th>Created</th><th>OU</th><th>Description</th></tr>'
+        foreach ($r in $ciAll) {
+            $k = (@($r.Name, $r.DnsName, $r.OS, $r.OU, $r.Description, $r.InOther) -join ' ')
+            $role = if ($r.IsDc) { 'Domain controller' } elseif ($r.IsServer) { 'Server' } else { 'Workstation' }
+            $nameCell = (HtmlEnc $r.Name)
+            if ($r.DnsName) { $nameCell += ("<div class='mut' style='font-size:11px'>{0}</div>" -f (HtmlEnc $r.DnsName)) }
+            if ($r.InOther) { $nameCell += (" <span class='badge bad'>Also in {0}</span>" -f (HtmlEnc $r.InOther)) }
+            A ("<tr class='row' data-k='{0}' data-en='{1}' data-srv='{2}' data-dc='{3}' data-never='{4}' data-dup='{5}'><td>{6}</td><td>{7}</td><td>{8}</td><td>{9}</td>{10}{11}{12}{13}<td class='mono'>{14}</td><td>{15}</td></tr>" -f `
+                (HtmlEnc $k),
+                $(if ($r.Enabled)   { '1' } else { '0' }),
+                $(if ($r.IsServer)  { '1' } else { '0' }),
+                $(if ($r.IsDc)      { '1' } else { '0' }),
+                $(if ($r.LastLogon) { '0' } else { '1' }),
+                $(if ($r.InOther)   { '1' } else { '0' }),
+                $nameCell, (HtmlEnc $r.OS), $role,
+                $(if ($r.Enabled) { '<span class="badge ok">Enabled</span>' } else { '<span class="badge bad">Disabled</span>' }),
+                (Write-WhenCell $r.LastLogon), (Write-DaysCell $r.DaysIdle), (Write-WhenCell $r.PwdLastSet), (Write-WhenCell $r.Created),
+                (HtmlEnc $r.OU), (HtmlEnc $r.Description))
+        }
+        A '</table>'
+    }
 }
 A '</section>'
 
@@ -4407,6 +6842,90 @@ $indexPath = Join-Path $reportDir ('{0}.html' -f $script:ReportName)
 if (-not $NoCsv) {
     Write-Step 'Writing CSV exports'
     $flatSettings | Export-Csv -Path (Join-Path $reportDir 'GPO-Settings.csv') -NoTypeInformation -Encoding UTF8
+
+    if ($compInv.Checked -and @($compInv.Rows).Count -gt 0) {
+        $compCsv = @()
+        foreach ($r in @($compInv.Rows)) {
+            $compCsv += [pscustomobject]@{
+                Computer           = $r.Name
+                DnsName            = $r.DnsName
+                OperatingSystem    = $r.OS
+                Role               = $(if ($r.IsDc) { 'Domain controller' } elseif ($r.IsServer) { 'Server' } else { 'Workstation' })
+                Enabled            = $r.Enabled
+                LastCheckIn        = $r.LastLogon
+                DaysIdle           = $r.DaysIdle
+                MachinePasswordSet = $r.PwdLastSet
+                Created            = $r.Created
+                OU                 = $r.OU
+                Description        = $r.Description
+                AlsoInDomain       = $r.InOther
+            }
+        }
+        $compCsv | Export-Csv -Path (Join-Path $reportDir 'AllComputers.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    if (@($domStruct.Trusts).Count -gt 0) {
+        $trustCsv = @()
+        foreach ($t in @($domStruct.Trusts)) {
+            $trustCsv += [pscustomobject]@{
+                OtherDomain   = $t.Partner
+                NetBiosName   = $t.Flat
+                Direction     = $t.Direction
+                Meaning       = $t.Meaning
+                Type          = $t.Kind
+                Transitive    = $t.Transitive
+                SidFiltering  = $t.SidFilter
+                SignInScope   = $t.Auth
+                TrustAccount  = $t.TrustAccount
+                Created       = $t.Created
+                Changed       = $t.Changed
+                RawAttributes = $t.Attributes
+            }
+        }
+        $trustCsv | Export-Csv -Path (Join-Path $reportDir 'Trusts.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    $xdUsers = @()
+    $xdComps = @()
+    foreach ($dc in @($domCompare)) {
+        foreach ($u in @($dc.DupUsers)) {
+            $xdUsers += [pscustomobject]@{
+                OtherDomain = $dc.Domain; Account = $u.Sam; NameHere = $u.NameHere; EnabledHere = $u.EnabledHere
+                PrivilegedHere = $u.Privileged; NameThere = $u.NameThere; EnabledThere = $u.EnabledThere; Source = $dc.Source
+            }
+        }
+        foreach ($c in @($dc.DupComputers)) {
+            $xdComps += [pscustomobject]@{
+                OtherDomain = $dc.Domain; Computer = $c.Name; OSHere = $c.OSHere; EnabledHere = $c.EnabledHere; LastCheckInHere = $c.LastHere
+                OSThere = $c.OSThere; EnabledThere = $c.EnabledThere; LastCheckInThere = $c.LastThere; ReallyJoinedTo = $c.LiveIn; Source = $dc.Source
+            }
+        }
+    }
+    if ($xdUsers.Count -gt 0) { $xdUsers | Export-Csv -Path (Join-Path $reportDir 'CrossDomain-Accounts.csv')  -NoTypeInformation -Encoding UTF8 }
+    if ($xdComps.Count -gt 0) { $xdComps | Export-Csv -Path (Join-Path $reportDir 'CrossDomain-Computers.csv') -NoTypeInformation -Encoding UTF8 }
+
+    if (@($otherDomains.Rows).Count -gt 0) {
+        $odCsv = @()
+        foreach ($o in @($otherDomains.Rows)) {
+            $odCsv += [pscustomobject]@{ Name = $o.Name; Evidence = (@($o.Evidence) -join ' | '); AnswersAsAdDomain = $o.Live; DomainControllers = $o.Dcs }
+        }
+        $odCsv | Export-Csv -Path (Join-Path $reportDir 'OtherDomain-Indicators.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    if (@($entraRows).Count -gt 0) {
+        $enCsv = @()
+        foreach ($er in @($entraRows)) { $enCsv += [pscustomobject]@{ Question = $er.Question; Answer = $er.Answer; Evidence = $er.Evidence } }
+        $enCsv | Export-Csv -Path (Join-Path $reportDir 'EntraIntune.csv') -NoTypeInformation -Encoding UTF8
+    }
+
+    if (@($msAffected.Rows).Count -gt 0) {
+        $afCsv = @()
+        foreach ($r in @($msAffected.Rows)) {
+            $afCsv += [pscustomobject]@{ Name = $r.Name; Account = $r.Sam; Type = $r.Kind; RemovableStorage = $r.Effect
+                Why = $r.Why; Enabled = $r.Enabled; OU = $r.OU }
+        }
+        $afCsv | Export-Csv -Path (Join-Path $reportDir 'MassStorage-Affected.csv') -NoTypeInformation -Encoding UTF8
+    }
 
     if (@($msReview.Rows).Count -gt 0) {
         $msReview.Rows |
@@ -4566,6 +7085,14 @@ if (-not $SkipCommitteeReport) {
         StaleComputers = $cleanup.StaleComputers.Count
         LogonChecked   = ($null -ne $logonScan)
         LogonRestricted = $(if ($logonScan) { @($logonScan.Rows).Count } else { 0 })
+        Policy         = $herePolicy
+        Structure      = [pscustomobject]@{
+            Checked    = $domStruct.Checked
+            ForestRoot = $domStruct.ForestRoot
+            Position   = $domStruct.Position
+            Domains    = @(@($domStruct.ForestDomains) | ForEach-Object { [string]$_.Dns })
+            Trusts     = @(@($domStruct.Trusts) | ForEach-Object { [pscustomobject]@{ p = [string]$_.Partner; d = [string]$_.Direction; k = [string]$_.Kind } })
+        }
     }
 
     # ------------------------------------ baseline: the state N days ago ----
@@ -5056,6 +7583,119 @@ if (-not $SkipCommitteeReport) {
         }
     }
 
+    # ---- domain structure: connected domains, and what a comparison with them found
+    if ($domStruct.Checked) {
+
+        $cmpMissing = @($domCompare | Where-Object { -not $_.Ok })
+        if ($cmpMissing.Count -gt 0) {
+            $missNames = ((@($cmpMissing | ForEach-Object { $_.Domain })) -join ', ')
+            Add-Finding 'Medium' ("{0} connected domain(s) are outside this review" -f $cmpMissing.Count) `
+                ("{0} is connected to {1} by a trust or a shared forest, and no scan of it was available to this report. Group Policy, password policy and privileged groups are set separately in every domain, so nothing in this report describes {1}." -f `
+                    $domStruct.ThisDns, $missNames) `
+                $script:ControlMap['structure'] 'structure-unscanned' `
+                (New-ListExhibit -Columns @('Domain', 'Relationship', 'Why it was not covered', 'Requested action') -Rows @(
+                    $cmpMissing | ForEach-Object { [pscustomobject]@{ 'Domain' = $_.Domain; 'Relationship' = $_.Relationship
+                        'Why it was not covered' = $_.Error
+                        'Requested action' = 'Run this report in that domain and review it with this one' } }) `
+                    -Action 'Run this report in each domain listed and bring the results to the committee together with this one.')
+        }
+
+        foreach ($dc in @($domCompare | Where-Object { $_.Ok })) {
+
+            $du   = @($dc.DupUsers)
+            $duOn = @($du | Where-Object { $_.BothEnabled })
+            if ($du.Count -gt 0) {
+                $duPriv = @($du | Where-Object { $_.Privileged })
+                $det = ("{0} sign-in name(s) exist in both {1} and {2}, {3} of them enabled in both. Each of these people holds two separate accounts with two separate passwords, under two different sets of rules." -f `
+                    $du.Count, $domStruct.ThisDns, $dc.Domain, $duOn.Count)
+                if ($duPriv.Count -gt 0) { $det += (" {0} of them hold privileged group membership in {1}." -f $duPriv.Count, $domStruct.ThisDns) }
+                Add-Finding $(if ($duPriv.Count -gt 0) { 'High' } else { 'Medium' }) `
+                    ("{0} account(s) exist in both {1} and {2}" -f $du.Count, $domStruct.ThisDns, $dc.Domain) `
+                    $det $script:ControlMap['structure'] 'structure-dup-accounts' `
+                    (New-ListExhibit -Columns @('Account', 'Name', 'State here', 'State in the other domain', 'Privileged here', 'Requested action') -Rows @(
+                        $du | ForEach-Object { [pscustomobject]@{ 'Account' = $_.Sam; 'Name' = $_.NameHere
+                            'State here' = $(if ($_.EnabledHere) { 'Enabled' } else { 'Disabled' })
+                            'State in the other domain' = $(if ($_.EnabledThere) { 'Enabled' } else { 'Disabled' })
+                            'Privileged here' = $(if ($_.Privileged) { $_.Privileged } else { '-' })
+                            'Requested action' = 'Confirm it is the same person; keep one account, retire the other' } }) `
+                        -Action ('For each account, confirm the two are the same person, decide which domain is the home account, and disable the one in the other domain. The other domain is {0}.' -f $dc.Domain))
+            }
+
+            if ($dc.WksHere -gt 0 -and $dc.WksThere -gt 0) {
+                Add-Finding 'Medium' ("Workstations are joined to two different domains") `
+                    ("{0} enabled workstation(s) are joined to {1} and {2} to {3}. A workstation takes its Group Policy, password rules and lockout rules from the domain it is joined to, so the same organization's PCs are running under two different sets of controls." -f `
+                        $dc.WksHere, $domStruct.ThisDns, $dc.WksThere, $dc.Domain) `
+                    $script:ControlMap['structure'] 'structure-split-computers' `
+                    (New-ListExhibit -Columns @('Domain', 'Enabled workstations', 'Enabled servers', 'Requested action') -Rows @(
+                        [pscustomobject]@{ 'Domain' = $domStruct.ThisDns; 'Enabled workstations' = $dc.WksHere; 'Enabled servers' = $dc.SrvHere
+                            'Requested action' = 'Decide whether workstations belong in this domain' },
+                        [pscustomobject]@{ 'Domain' = $dc.Domain; 'Enabled workstations' = $dc.WksThere; 'Enabled servers' = $dc.SrvThere
+                            'Requested action' = 'Decide whether workstations belong in this domain' }) `
+                        -Action 'Decide which one domain workstations are to be joined to, record the decision, and schedule the move of the workstations that are in the other. The full list for each domain is in its AllComputers.csv.')
+            }
+
+            $dcx = @($dc.DupComputers)
+            if ($dcx.Count -gt 0) {
+                Add-Finding 'Low' ("{0} computer(s) have an account in both {1} and {2}" -f $dcx.Count, $domStruct.ThisDns, $dc.Domain) `
+                    'A computer is joined to one domain at a time, so one account of each pair is a leftover from a move or a rebuild. Leftover computer accounts still exist as objects that can be re-used.' `
+                    $script:ControlMap['structure'] 'structure-dup-computers' `
+                    (New-ListExhibit -Columns @('Computer', 'Last check-in here', 'Last check-in in the other domain', 'Really joined to', 'Requested action') -Rows @(
+                        $dcx | ForEach-Object { [pscustomobject]@{ 'Computer' = $_.Name
+                            'Last check-in here' = $(if ($_.LastHere) { $_.LastHere } else { 'Never' })
+                            'Last check-in in the other domain' = $(if ($_.LastThere) { $_.LastThere } else { 'Not supplied' })
+                            'Really joined to' = $_.LiveIn
+                            'Requested action' = 'Disable and delete the account in the domain it is not joined to' } }) `
+                        -Action ('For each computer, disable and then delete the account in the domain it is NOT joined to. The other domain is {0}.' -f $dc.Domain))
+            }
+
+            if ($dc.PolicyDiff -gt 0) {
+                Add-Finding 'Medium' ("Password and lockout policy differs between {0} and {1}" -f $domStruct.ThisDns, $dc.Domain) `
+                    ("{0} of the three account-policy values compared are different in the two domains. Where the same people use both, or a trust lets accounts from one reach the other, the weaker policy sets the real level of protection." -f $dc.PolicyDiff) `
+                    $script:ControlMap['structure'] 'structure-policy-mismatch' `
+                    (New-ListExhibit -Columns @('Setting', 'This domain', 'Other domain', 'Result', 'Requested action') -Rows @(
+                        @($dc.Policy) | ForEach-Object { [pscustomobject]@{ 'Setting' = $_.Setting; 'This domain' = $_.Here; 'Other domain' = $_.There
+                            'Result' = $_.State
+                            'Requested action' = $(if ($_.State -eq 'Different') { 'Align both domains to the stricter value' } else { '-' }) } }) `
+                        -Action ('Align the account policy of {0} and {1} to the stricter value of each setting, or record the approved reason for the difference.' -f $domStruct.ThisDns, $dc.Domain))
+            }
+        }
+
+        if (@($foreignPriv).Count -gt 0) {
+            Add-Finding 'High' ("{0} account(s) from another domain hold privileged group membership" -f @($foreignPriv).Count) `
+                ("Members of this domain's privileged groups that are accounts in another domain: {0}. They administer this domain but are created, disabled and password-managed under another domain's rules." -f `
+                    ((@($foreignPriv | ForEach-Object { '{0} in {1}' -f $_.Member, $_.Group })) -join '; ')) `
+                $script:ControlMap['privileged'] 'structure-foreign-priv' `
+                (New-ListExhibit -Columns @('Account', 'Group', 'Where it comes from', 'Requested action') -Rows @(
+                    $foreignPriv | ForEach-Object { [pscustomobject]@{ 'Account' = $_.Member; 'Group' = $_.Group; 'Where it comes from' = $_.Origin
+                        'Requested action' = $(if ($_.Resolved) { 'Remove unless a documented need exists' } else { 'Remove - the account behind it cannot be identified' }) } }) `
+                    -Action 'Remove each account from the privileged group listed unless there is a documented, approved need for an outside account to administer this domain.')
+        }
+
+        $sidRisk = @($domStruct.Trusts | Where-Object { $_.SidRisk })
+        if ($sidRisk.Count -gt 0) {
+            Add-Finding 'High' ("SID filtering is off on {0} trust(s)" -f $sidRisk.Count) `
+                ("This domain trusts {0} without SID filtering in force. An administrator of the trusted domain can then present credentials that carry this domain's privileged group identities." -f `
+                    ((@($sidRisk | ForEach-Object { $_.Partner })) -join ', ')) `
+                $script:ControlMap['structure'] 'structure-sidfilter' `
+                (New-ListExhibit -Columns @('Trusted domain', 'Trust type', 'Direction', 'SID filtering', 'Requested action') -Rows @(
+                    $sidRisk | ForEach-Object { [pscustomobject]@{ 'Trusted domain' = $_.Partner; 'Trust type' = $_.Kind; 'Direction' = $_.Direction
+                        'SID filtering' = $_.SidFilter; 'Requested action' = 'Turn SID filtering on' } }) `
+                    -Action 'Turn SID filtering on for each trust listed. If a migration that needs SID history is in progress, record its end date on this ticket and turn filtering on when it finishes.')
+        }
+
+        $odLive = @($otherDomains.Rows | Where-Object { $_.Live -eq 'Yes' })
+        if ($odLive.Count -gt 0) {
+            Add-Finding 'Low' ("{0} other Active Directory domain(s) are indicated but not connected" -f $odLive.Count) `
+                ("This domain holds references to {0}, which answer as live Active Directory domains but have no trust or forest relationship with this one." -f `
+                    ((@($odLive | ForEach-Object { $_.Name })) -join ', ')) `
+                $script:ControlMap['structure'] 'structure-indicators' `
+                (New-ListExhibit -Columns @('Domain', 'Evidence', 'Domain controllers', 'Requested action') -Rows @(
+                    $odLive | ForEach-Object { [pscustomobject]@{ 'Domain' = $_.Name; 'Evidence' = ((@($_.Evidence)) -join '; ')
+                        'Domain controllers' = $_.Dcs; 'Requested action' = 'Identify the owner and whether it is in use; scan it if so' } }) `
+                    -Action 'For each domain listed, identify its owner and whether staff or computers use it. Scan any that is in use and decommission any that is not.')
+        }
+    }
+
     if ($unlinked.Count -gt 0) {
         Add-Finding 'Low' ("{0} Group Policy Object(s) are not linked anywhere" -f $unlinked.Count) `
             'Unlinked GPOs apply to nothing. Confirm they are intentional and remove those that are obsolete.' `
@@ -5091,8 +7731,8 @@ if (-not $SkipCommitteeReport) {
 body{margin:0;background:#fff;color:var(--ink);font:13.5px/1.55 "Segoe UI",system-ui,-apple-system,sans-serif}
 .page{max-width:980px;margin:0 auto;padding:36px 44px 60px}
 h1{font-size:23px;margin:0 0 2px}
-h2{font-size:15px;margin:30px 0 10px;padding-bottom:5px;border-bottom:2px solid var(--ink);text-transform:uppercase;letter-spacing:.05em}
-h3{font-size:13.5px;margin:18px 0 6px}
+h2{font-size:15px;margin:30px 0 10px;padding-bottom:5px;color:var(--accent);border-bottom:2px solid var(--accent);text-transform:uppercase;letter-spacing:.05em}
+h3{font-size:13.5px;margin:18px 0 6px;padding-bottom:3px;color:var(--accent);border-bottom:1px solid var(--line)}
 .sub{color:var(--mut);font-size:12.5px}
 table{width:100%;border-collapse:collapse;font-size:12.5px;margin:8px 0 4px}
 th{text-align:left;padding:7px 9px;background:var(--chip);border:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#333}
@@ -5250,9 +7890,110 @@ a{color:var(--accent)}
     if ($null -ne $logonScan) {
         C ("<li>{0} user account(s) carry a logon-hour, workstation or account-expiry restriction.</li>" -f @($logonScan.Rows).Count)
     }
+    if ($domStruct.Checked) {
+        if (@($connectedNames).Count -eq 0) {
+            C '<li>The domain stands alone: there is no other domain in its forest and it has no trusts.</li>'
+        }
+        else {
+            C ("<li>The domain is connected to {0} other domain(s) ({1}); {2} of them could be compared with this one. Group Policy does not cross between domains, so each needs its own review.</li>" -f `
+                @($connectedNames).Count, (HtmlEnc (@($connectedNames) -join ', ')), @($domCompare | Where-Object { $_.Ok }).Count)
+        }
+    }
+    if ($entra.Checked) {
+        C ("<li>Microsoft Entra ID and Intune, as far as Active Directory shows: directory sync {0}; Entra hybrid join {1}; Intune automatic enrollment by Group Policy is {2}.</li>" -f `
+            $(if ((@($entra.SyncAccounts).Count + @($entra.CloudSyncAgents).Count) -gt 0) { 'is set up' } else { 'was not found' }),
+            $(if ($entra.Scp.Present) { 'is configured' } else { 'is not configured' }),
+            (HtmlEnc "$($entra.EnrollState)".ToLower()))
+    }
     if ($hi -eq 0 -and $med -eq 0) { C '<li>No high or medium findings were identified in this review.</li>' }
     else { C ("<li><b>{0} item(s) require management attention</b>, detailed under Open Items below.</li>" -f ($hi + $med)) }
     C '</ul>'
+
+    # ---- domain structure and the scope of this review
+    C '<h2>Domain structure and scope</h2>'
+    if (-not $domStruct.Checked) {
+        C ("<div class='note'><b>Not checked.</b> {0} The scope of this review against other domains is therefore not established.</div>" -f (HtmlEnc $domStruct.Error))
+    }
+    else {
+        C ("<div style='margin:6px 0 8px'><b>{0}</b> is {1}. Forest: <b>{2}</b>.</div>" -f `
+            (HtmlEnc $domStruct.ThisDns), (HtmlEnc $domStruct.PositionText), (HtmlEnc $domStruct.ForestRoot))
+
+        if (@($connectedNames).Count -eq 0) {
+            C '<div class="same-note"><b>Stands alone.</b> There is no other domain in this forest and no trust to any other domain. No account from outside can be given access here through Active Directory, and this review covers the whole directory.</div>'
+        }
+        else {
+            C ("<div class='note'><b>This review covers {0} only.</b> Group Policy does not cross a domain boundary: nothing configured here applies to another domain, and nothing in another domain applies here. What does cross is sign-in, in the direction each trust allows. The domain(s) below are connected to this one and each needs its own review.</div>" -f (HtmlEnc $domStruct.ThisDns))
+
+            C '<table><tr><th style="width:22%">Connected domain</th><th style="width:20%">Relationship</th><th style="width:38%">What it means</th><th style="width:20%">Covered with this review?</th></tr>'
+            foreach ($cn in @($connectedNames)) {
+                $rel  = ''
+                $mean = ''
+                foreach ($d in @($domStruct.ForestDomains)) {
+                    if ("$($d.Dns)" -eq "$cn") { $rel = ('{0} (same forest)' -f $d.Relation); $mean = 'Shares a forest with this domain. Accounts in either can be given access in the other, and the forest root administers both.' }
+                }
+                foreach ($t in @($domStruct.Trusts)) {
+                    if ("$($t.Partner)" -eq "$cn") {
+                        $rel  = ('{0}: {1}' -f $t.Kind, $t.Direction)
+                        $mean = $t.Meaning
+                        if ($t.SidRisk) { $mean += ' SID filtering is not in force on this trust.' }
+                    }
+                }
+                $cov = '<span class="st no">No &ndash; not scanned</span>'
+                foreach ($dc in @($domCompare)) {
+                    if ("$($dc.Domain)" -eq "$cn" -and $dc.Ok) { $cov = ('<span class="st ok">Compared</span><div class="sub">{0}, {1}</div>' -f (HtmlEnc $dc.Source), (HtmlEnc $dc.When)) }
+                }
+                C ("<tr><td><b>{0}</b></td><td>{1}</td><td>{2}</td><td>{3}</td></tr>" -f (HtmlEnc $cn), (HtmlEnc $rel), (HtmlEnc $mean), $cov)
+            }
+            C '</table>'
+        }
+
+        foreach ($dc in @($domCompare | Where-Object { $_.Ok })) {
+            C ("<h3>Compared with {0}</h3>" -f (HtmlEnc $dc.Domain))
+            C ("<table><tr><th style='width:40%'>Measure</th><th style='width:30%'>{0}</th><th style='width:30%'>{1}</th></tr>" -f (HtmlEnc $domStruct.ThisDns), (HtmlEnc $dc.Domain))
+            C ("<tr><td>User accounts</td><td>{0}</td><td>{1}</td></tr>" -f $dc.UsersHere, $dc.UsersThere)
+            C ("<tr><td>Enabled workstations</td><td>{0}</td><td>{1}</td></tr>" -f $dc.WksHere, $dc.WksThere)
+            C ("<tr><td>Enabled servers</td><td>{0}</td><td>{1}</td></tr>" -f $dc.SrvHere, $dc.SrvThere)
+            foreach ($pr in @($dc.Policy)) {
+                C ("<tr><td>{0}</td><td class='{3}'>{1}</td><td class='{3}'>{2}</td></tr>" -f `
+                    (HtmlEnc $pr.Setting), (HtmlEnc $pr.Here), (HtmlEnc $pr.There), $(if ($pr.State -eq 'Different') { 'diff' } else { '' }))
+            }
+            C ("<tr><td><b>Accounts that exist in both</b></td><td colspan='2' class='{1}'>{0}, of which {2} are enabled in both</td></tr>" -f `
+                @($dc.DupUsers).Count, $(if (@($dc.DupUsers).Count -gt 0) { 'diff' } else { 'same' }), @($dc.DupUsers | Where-Object { $_.BothEnabled }).Count)
+            C ("<tr><td><b>Computers with an account in both</b></td><td colspan='2' class='{1}'>{0}</td></tr>" -f `
+                @($dc.DupComputers).Count, $(if (@($dc.DupComputers).Count -gt 0) { 'diff' } else { 'same' }))
+            C '</table>'
+        }
+
+        if (@($foreignPriv).Count -gt 0) {
+            C ("<div class='note'><b>{0} account(s) from another domain</b> are members of this domain&rsquo;s privileged groups. See Open Items.</div>" -f @($foreignPriv).Count)
+        }
+        $odLiveC = @($otherDomains.Rows | Where-Object { $_.Live -eq 'Yes' })
+        if ($odLiveC.Count -gt 0) {
+            C ("<div class='note'><b>{0} other Active Directory domain(s)</b> are referred to from this domain without any trust or forest relationship: {1}. See Open Items.</div>" -f `
+                $odLiveC.Count, (HtmlEnc ((@($odLiveC | ForEach-Object { $_.Name })) -join ', ')))
+        }
+        elseif ($otherDomains.Checked) {
+            C '<div class="sub">No indicators of an unconnected Active Directory domain were found in the places checked. That is not proof that none exists.</div>'
+        }
+    }
+
+    # ---- the on-premises footprints of Entra ID and Intune
+    C '<h3>Microsoft Entra ID and Intune</h3>'
+    if (-not $entra.Checked) {
+        C ("<div class='note'><b>Not checked.</b> {0}</div>" -f (HtmlEnc $entra.Error))
+    }
+    else {
+        C '<table><tr><th style="width:28%">Question</th><th style="width:18%">Answer</th><th style="width:54%">Evidence in Active Directory</th></tr>'
+        foreach ($er in @($entraRows)) {
+            $cls = ''
+            if     ($er.Tone -eq 'ok')   { $cls = 'st ok' }
+            elseif ($er.Tone -eq 'bad')  { $cls = 'st no' }
+            elseif ($er.Tone -eq 'warn') { $cls = 'diff' }
+            C ("<tr><td><b>{0}</b></td><td class='{1}'>{2}</td><td>{3}</td></tr>" -f (HtmlEnc $er.Question), $cls, (HtmlEnc $er.Answer), (HtmlEnc $er.Evidence))
+        }
+        C '</table>'
+        C '<div class="sub">Read from Active Directory only. Sync health, device registration and Intune policy assignment are held in the Microsoft 365 tenant and are outside this review.</div>'
+    }
 
     # ---- configuration drift over the review window
     C ("<h2>Change over the last {0} days</h2>" -f $(if ($prev) { $driftAgeDays } else { $DriftDays }))
@@ -5417,6 +8158,10 @@ a{color:var(--accent)}
         $(if ($null -ne $logonScan) { '<span class="st ok">Reviewed</span>' } else { '<span class="st no">Not checked</span>' }),
         $(if ($null -ne $logonScan) { 'logonHours, logonWorkstations, account expiry' } else { '<span class="sub">Not collected</span>' }),
         (Format-Ref $script:ControlMap['logon']))
+    C ("<tr><td><b>J.</b> Domain structure and trusts</td><td>{0}</td><td>{1}</td><td>{2}</td></tr>" -f `
+        $(if ($domStruct.Checked) { '<span class="st ok">Reviewed</span>' } else { '<span class="st no">Not checked</span>' }),
+        $(if ($domStruct.Checked) { 'Forest position, trusts, accounts and computers shared with connected domains' } else { '<span class="sub">Not collected</span>' }),
+        (Format-Ref $script:ControlMap['structure']))
 
     C '</table>'
     C '<div class="note"><b>On the references:</b> FFIEC citations are to the current IT Examination Handbook booklets. NIST CSF 2.0 gives the Function and Category. CRI Profile references are to the Cyber Risk Institute Profile v2.x at the <i>Category</i> level; the Profile identifies individual requirements as diagnostic statements in the form <span class="mono">FUNCTION.CATEGORY-##.##</span>, so if your institution reports against specific diagnostic statements, add those numbers from your licensed Profile workbook. CIS Controls v8 safeguards are included for institutions whose hardening standard is the Center for Internet Security Benchmarks. These are the default mappings shipped with the script and are a starting point &ndash; confirm them against your institution&rsquo;s own control set and your examiner&rsquo;s expectations. They are defined in one place at the top of the script ($script:ControlMap) and can be edited to match your house citations. Framework names are used for mapping and identification only; no endorsement, certification or affiliation is implied.</div>'
